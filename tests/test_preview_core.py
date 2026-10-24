@@ -11,6 +11,7 @@
 import base64
 import http.client
 import json
+import re
 import sys
 import threading
 import time
@@ -83,18 +84,18 @@ class PublishGateTests(unittest.TestCase):
 
 class JpegMarkerTests(unittest.TestCase):
     def test_markers_accept_fake_frames(self):
-        for key in ("lower", "upper"):
+        for key in ("left", "right"):
             payload = base64.b64decode(preview.FAKE_JPEGS[key])
             self.assertTrue(preview.has_jpeg_markers(payload), key)
 
     def test_markers_reject_truncated_payload(self):
-        payload = base64.b64decode(preview.FAKE_JPEGS["lower"])
+        payload = base64.b64decode(preview.FAKE_JPEGS["left"])
         self.assertFalse(preview.has_jpeg_markers(payload[:-2]))
         self.assertFalse(preview.has_jpeg_markers(b"not a jpeg"))
 
     def test_fake_frames_have_baseline_structure(self):
         """Структурная проверка (SOI/EOI/SOF), не декодирование изображения."""
-        for key in ("lower", "upper"):
+        for key in ("left", "right"):
             payload = base64.b64decode(preview.FAKE_JPEGS[key])
             self.assertTrue(payload.startswith(b"\xff\xd8"), key)
             self.assertTrue(payload.endswith(b"\xff\xd9"), key)
@@ -107,7 +108,7 @@ class JpegMarkerTests(unittest.TestCase):
 
 class StatusTests(unittest.TestCase):
     def test_snapshot_reports_errors_and_age(self):
-        runtime = preview.CameraRuntime("lower", "Нижняя камера", "/dev/video2")
+        runtime = preview.CameraRuntime("left", "Левая камера", "/dev/video2")
         runtime.note_packet(10.0)
         runtime.note_publish(10.0)
         runtime.set_state("running")
@@ -120,7 +121,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(snapshot["published_frames"], 1)
 
     def test_snapshot_without_frames(self):
-        runtime = preview.CameraRuntime("upper", "Верхняя камера", "/dev/video4")
+        runtime = preview.CameraRuntime("right", "Правая камера", "/dev/video4")
         snapshot = runtime.snapshot(now=1.0)
         self.assertFalse(snapshot["has_frame"])
         self.assertIsNone(snapshot["last_frame_age_s"])
@@ -130,7 +131,7 @@ class StatusTests(unittest.TestCase):
 class FakeServerCase(unittest.TestCase):
     def setUp(self):
         self.app = preview.PreviewApp(
-            devices={"upper": "/dev/video4", "lower": "/dev/video2"},
+            devices={"left": "/dev/video2", "right": "/dev/video4"},
             fps=20.0,
             max_clients=2,
             fake_cameras=True,
@@ -169,24 +170,40 @@ class FakeServerCase(unittest.TestCase):
                 f"http://127.0.0.1:{self.port}/status.json", timeout=3) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def test_page_has_two_labeled_cameras(self):
+    def get_page(self):
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}/", timeout=3) as resp:
-            body = resp.read().decode("utf-8")
-        self.assertIn("Верхняя камера", body)
-        self.assertIn("Нижняя камера", body)
-        self.assertIn('"key": "upper"', body)
-        self.assertIn('"key": "lower"', body)
-        self.assertIn('"device": "/dev/video4"', body)
+            return resp.read().decode("utf-8")
+
+    def test_page_has_two_labeled_cameras(self):
+        body = self.get_page()
+        self.assertIn("Левая камера", body)
+        self.assertIn("Правая камера", body)
+        self.assertIn('"key": "left"', body)
+        self.assertIn('"key": "right"', body)
         self.assertIn('"device": "/dev/video2"', body)
+        self.assertIn('"device": "/dev/video4"', body)
         self.assertIn("const CAMERAS", body)
+
+    def test_page_order_is_left_then_right(self):
+        match = re.search(r"const CAMERAS = (\[.*?\]);", self.get_page(), re.DOTALL)
+        self.assertIsNotNone(match)
+        cameras = json.loads(match.group(1))
+        self.assertEqual([camera["key"] for camera in cameras],
+                         ["left", "right"])
+        self.assertEqual([camera["label"] for camera in cameras],
+                         ["Левая камера", "Правая камера"])
+        self.assertEqual([camera["device"] for camera in cameras],
+                         ["/dev/video2", "/dev/video4"])
 
     def test_status_contract(self):
         status = self.wait_for_frames()
         self.assertEqual(status["app"], "usv-preview")
         self.assertTrue(status["fake_cameras"])
         self.assertIn("не визуальная задержка", status["note"])
-        self.assertEqual(set(status["cameras"]), {"lower", "upper"})
+        self.assertEqual(set(status["cameras"]), {"left", "right"})
+        self.assertEqual(status["cameras"]["left"]["device"], "/dev/video2")
+        self.assertEqual(status["cameras"]["right"]["device"], "/dev/video4")
         for camera in status["cameras"].values():
             self.assertEqual(camera["state"], "running")
             self.assertGreater(camera["published_frames"], 0)
@@ -197,7 +214,7 @@ class FakeServerCase(unittest.TestCase):
     def test_stream_returns_multipart_jpeg(self):
         self.wait_for_frames()
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        connection.request("GET", "/stream/lower.mjpg")
+        connection.request("GET", "/stream/left.mjpg")
         response = connection.getresponse()
         self.assertEqual(response.status, 200)
         self.assertIn("multipart/x-mixed-replace", response.getheader("Content-Type"))
@@ -220,7 +237,7 @@ class FakeServerCase(unittest.TestCase):
     def test_diagnostic_frame_endpoint(self):
         self.wait_for_frames()
         with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.port}/diagnostics/frame.jpg?camera=upper",
+                f"http://127.0.0.1:{self.port}/diagnostics/frame.jpg?camera=right",
                 timeout=3) as resp:
             self.assertEqual(resp.headers.get("Content-Type"), "image/jpeg")
             body = resp.read()
@@ -236,15 +253,15 @@ class FakeServerCase(unittest.TestCase):
     def test_client_limit(self):
         self.wait_for_frames()
         first = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        first.request("GET", "/stream/lower.mjpg")
+        first.request("GET", "/stream/left.mjpg")
         first_response = first.getresponse()
         self.assertEqual(first_response.status, 200)
         second = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        second.request("GET", "/stream/upper.mjpg")
+        second.request("GET", "/stream/right.mjpg")
         second_response = second.getresponse()
         self.assertEqual(second_response.status, 200)
         third = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        third.request("GET", "/stream/lower.mjpg")
+        third.request("GET", "/stream/left.mjpg")
         third_response = third.getresponse()
         self.assertEqual(third_response.status, 503)
         first.close()
@@ -253,14 +270,17 @@ class FakeServerCase(unittest.TestCase):
 
 
 class FakeModeIsolationTests(unittest.TestCase):
-    def test_fake_mode_does_not_open_devices_and_does_not_import_av(self):
-        app = preview.PreviewApp(
-            devices={"upper": "/dev/video4", "lower": "/dev/video2"},
+    def _app(self):
+        return preview.PreviewApp(
+            devices={"left": "/dev/video2", "right": "/dev/video4"},
             fps=20.0,
             max_clients=2,
             fake_cameras=True,
             fake_capture_fps=60.0,
         )
+
+    def test_fake_mode_does_not_open_devices_and_does_not_import_av(self):
+        app = self._app()
         app.start()
         try:
             time.sleep(0.2)
@@ -270,13 +290,7 @@ class FakeModeIsolationTests(unittest.TestCase):
             self.assertEqual(app.stop(join_timeout=2.0), [])
 
     def test_stop_marks_cameras_stopped(self):
-        app = preview.PreviewApp(
-            devices={"upper": "/dev/video4", "lower": "/dev/video2"},
-            fps=20.0,
-            max_clients=2,
-            fake_cameras=True,
-            fake_capture_fps=60.0,
-        )
+        app = self._app()
         app.start()
         time.sleep(0.1)
         self.assertEqual(app.stop(join_timeout=2.0), [])

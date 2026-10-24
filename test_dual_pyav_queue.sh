@@ -3,9 +3,10 @@ set -u
 
 PY="$HOME/recorder/venv-pyav14/bin/python"
 RECORDER="$HOME/recorder/record_camera_pyav_queue.py"
+WRAPPER="$HOME/recorder/record_dual_session.py"
 
-if [[ ! -x "$PY" || ! -f "$RECORDER" ]]; then
-    echo "Не найден интерпретатор или скрипт регистратора."
+if [[ ! -x "$PY" || ! -f "$RECORDER" || ! -f "$WRAPPER" ]]; then
+    echo "Не найден интерпретатор, рекордер или wrapper записи двух камер."
     exit 1
 fi
 
@@ -21,66 +22,68 @@ for DEVICE in /dev/video2 /dev/video4; do
     fi
 done
 
-TESTLOG=$(mktemp -d "$HOME/camera_tests/dual_queue_logs_XXXXXX") || exit 1
+WRAPPER_LOG=$(mktemp "${TMPDIR:-/tmp}/usv_dual_queue_XXXXXX") || exit 1
 
-"$PY" "$RECORDER" --camera-id cam_lower --device /dev/video2     --seconds 10 --segment-seconds 10 > "$TESTLOG/cam_lower.log" 2>&1 &
-LOWER_PID=$!
-"$PY" "$RECORDER" --camera-id cam_upper --device /dev/video4     --seconds 10 --segment-seconds 10 > "$TESTLOG/cam_upper.log" 2>&1 &
-UPPER_PID=$!
-
-stop_children() {
-    trap '' INT TERM
-    echo "Запрошена остановка обеих камер..."
-    kill -TERM "$LOWER_PID" "$UPPER_PID" 2>/dev/null || true
-    wait "$LOWER_PID" 2>/dev/null || true
-    wait "$UPPER_PID" 2>/dev/null || true
-    echo "Логи: $TESTLOG"
-    exit 130
-}
-trap stop_children INT TERM
-
-echo "Запущены обе камеры. Ожидайте запись и проверку файлов."
-echo "Логи: $TESTLOG"
-wait "$LOWER_PID"
-LOWER_CODE=$?
-wait "$UPPER_PID"
-UPPER_CODE=$?
+# Wrapper сам обрабатывает SIGINT/SIGTERM и завершает оба рекордера.
+trap '' INT TERM
+"$PY" "$WRAPPER" --seconds 10 --segment-seconds 10 2>&1 | tee "$WRAPPER_LOG"
+WRAPPER_CODE=${PIPESTATUS[0]}
 trap - INT TERM
 
-echo "Код нижней камеры: $LOWER_CODE"
-echo "Код верхней камеры: $UPPER_CODE"
-for CAMERA in cam_lower cam_upper; do
+SESSION=$(awk '/^Output: /{line=substr($0, 9)} END{print line}' "$WRAPPER_LOG")
+if [[ -z "$SESSION" || ! -d "$SESSION" ]]; then
+    echo "Не удалось определить каталог сессии из строки Output:."
+    echo "Код wrapper: $WRAPPER_CODE; лог wrapper: $WRAPPER_LOG"
+    exit 1
+fi
+
+echo "Сессия: $SESSION"
+echo "Код wrapper: $WRAPPER_CODE"
+echo "Лог wrapper: $WRAPPER_LOG"
+
+for CAMERA in cam-left cam-right; do
     echo "===== $CAMERA: ЛОГ ====="
-    cat "$TESTLOG/$CAMERA.log"
+    if [[ -f "$SESSION/$CAMERA.log" ]]; then
+        cat "$SESSION/$CAMERA.log"
+    else
+        echo "Нет файла $SESSION/$CAMERA.log"
+    fi
 done
 
-"$PY" - "$TESTLOG" <<'PY'
+"$PY" - "$SESSION" <<'PY'
+# -*- coding: utf-8 -*-
 import csv
 import json
 import statistics
 import sys
 from pathlib import Path
 
-logs = Path(sys.argv[1])
-for camera in ("cam_lower", "cam_upper"):
+session = Path(sys.argv[1])
+failed = False
+for camera in ("cam-left", "cam-right"):
     print(f"===== {camera}: СВОДКА =====")
+    folder = session / camera
     try:
-        lines = (logs / f"{camera}.log").read_text(encoding="utf-8").splitlines()
-        paths = [line[len("Output: "):] for line in lines if line.startswith("Output: ")]
-        folder = Path(paths[-1])
-        metadata = json.loads((folder / "session_metadata.json").read_text(encoding="utf-8"))
+        metadata = json.loads(
+            (folder / "session_metadata.json").read_text(encoding="utf-8"))
         with (folder / "frames.csv").open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         stamps = [int(row["host_receive_monotonic_ns"]) for row in rows]
-        gaps = [(right-left)/1e6 for left, right in zip(stamps, stamps[1:])]
-        span = (stamps[-1]-stamps[0])/1e9 if len(stamps) >= 2 else 0
+        gaps = [(right - left) / 1e6
+                for left, right in zip(stamps, stamps[1:])]
+        span = (stamps[-1] - stamps[0]) / 1e9 if len(stamps) >= 2 else 0
+        if metadata.get("status") != "verified":
+            failed = True
+        if not rows:
+            failed = True
         summary = {
-            "session": str(folder), "status": metadata.get("status"),
+            "session": str(folder),
+            "status": metadata.get("status"),
             "accepted_packets": metadata.get("accepted_packets"),
             "written_packets": metadata.get("writer", {}).get("written_packets"),
             "indexed_packets": len(rows),
             "receive_span_s": span,
-            "receive_rate": (len(stamps)-1)/span if span > 0 else None,
+            "receive_rate": (len(stamps) - 1) / span if span > 0 else None,
             "median_host_gap_ms": statistics.median(gaps) if gaps else None,
             "max_host_gap_ms": max(gaps) if gaps else None,
             "host_gaps_over_25_ms": sum(gap > 25 for gap in gaps),
@@ -93,9 +96,19 @@ for camera in ("cam_lower", "cam_upper"):
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     except Exception as exc:
+        failed = True
         print(f"Не удалось построить сводку: {type(exc).__name__}: {exc}")
-PY
 
-if [[ "$LOWER_CODE" -ne 0 || "$UPPER_CODE" -ne 0 ]]; then
+sys.exit(1 if failed else 0)
+PY
+SUMMARY_CODE=$?
+
+if [[ "$WRAPPER_CODE" -ne 0 ]]; then
+    echo "Wrapper завершился с кодом $WRAPPER_CODE; см. метаданные и логи."
     exit 1
 fi
+if [[ "$SUMMARY_CODE" -ne 0 ]]; then
+    echo "Одна или обе записи не прошли проверку; см. сводку и метаданные."
+    exit 1
+fi
+echo "Обе камеры записаны и проверены: $SESSION"

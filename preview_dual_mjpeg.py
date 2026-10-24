@@ -41,7 +41,7 @@ DEFAULT_MAX_CLIENTS = 8
 
 # Тестовые кадры: настоящие JPEG (SOI/EOI и таблицы), только для --fake-cameras.
 FAKE_JPEGS = {
-    "lower": (
+    "left": (
         "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABsSFBcUERsXFhceHBsgKEIrKCUlKFE6PTBCYFVlZF9VXVtqeJmBanGQc1tdhbWG"
         "kJ6jq62rZ4C8ybqmx5moq6T/2wBDARweHigjKE4rK06kbl1upKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSk"
         "pKSkpKSkpKSkpKSkpKT/wAARCACQAQADASIAAhEBAxEB/8QAGAABAQEBAQAAAAAAAAAAAAAAAwQAAQL/xAArEAACAgEBBwMF"
@@ -124,7 +124,7 @@ FAKE_JPEGS = {
         "a6jyQ45dp1xtmLl8YsWgCyQAEzprnv01m+x2uM77JRO3aJTJHwczXp7VjV04VbYynIg+4fG384np6LNLldllftiNu0+4f+HM"
         "t27U6sgyLp/p2nWOOXqn/9k="
     ),
-    "upper": (
+    "right": (
         "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABsSFBcUERsXFhceHBsgKEIrKCUlKFE6PTBCYFVlZF9VXVtqeJmBanGQc1tdhbWG"
         "kJ6jq62rZ4C8ybqmx5moq6T/2wBDARweHigjKE4rK06kbl1upKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSk"
         "pKSkpKSkpKSkpKSkpKT/wAARCACQAQADASIAAhEBAxEB/8QAGAABAQEBAQAAAAAAAAAAAAAAAwQAAQL/xAAqEAABBAECBQMF"
@@ -205,10 +205,10 @@ FAKE_JPEGS = {
 }
 
 CAMERA_SPECS = (
-    {"key": "upper", "label": "Верхняя камера", "device_arg": "device_upper",
-     "default_device": "/dev/video4"},
-    {"key": "lower", "label": "Нижняя камера", "device_arg": "device_lower",
+    {"key": "left", "label": "Левая камера", "device_arg": "device_left",
      "default_device": "/dev/video2"},
+    {"key": "right", "label": "Правая камера", "device_arg": "device_right",
+     "default_device": "/dev/video4"},
 )
 
 PREVIEW_HTML = """<!doctype html>
@@ -950,7 +950,7 @@ class PreviewHandler(BaseHTTPRequestHandler):
         if path == "/status.json":
             return self._send_status()
         if path == "/diagnostics/frame.jpg":
-            key = parse_qs(parsed.query).get("camera", ["lower"])[0]
+            key = parse_qs(parsed.query).get("camera", ["left"])[0]
             return self._send_diagnostic_frame(key)
         if path.startswith("/stream/") and path.endswith(".mjpg"):
             key = path[len("/stream/"):-len(".mjpg")]
@@ -1063,10 +1063,10 @@ def build_parser():
                         help=f"порт HTTP (по умолчанию {DEFAULT_PORT})")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS,
                         help="частота ПУБЛИКАЦИИ кадров на камеру (по умолчанию 8)")
-    parser.add_argument("--device-upper", default="/dev/video4",
-                        help="устройство верхней камеры")
-    parser.add_argument("--device-lower", default="/dev/video2",
-                        help="устройство нижней камеры")
+    parser.add_argument("--device-left", default="/dev/video2",
+                        help="устройство левой камеры")
+    parser.add_argument("--device-right", default="/dev/video4",
+                        help="устройство правой камеры")
     parser.add_argument("--max-clients", type=int, default=DEFAULT_MAX_CLIENTS,
                         help="максимум одновременных MJPEG-потоков")
     parser.add_argument("--fake-cameras", action="store_true",
@@ -1112,8 +1112,8 @@ def main(argv=None):
                   file=sys.stderr)
 
     devices = {
-        "upper": args.device_upper,
-        "lower": args.device_lower,
+        "left": args.device_left,
+        "right": args.device_right,
     }
     app = PreviewApp(
         devices=devices,
@@ -1150,8 +1150,8 @@ def main(argv=None):
         print("Просмотр камер запущен.", flush=True)
         print(f"Страница: http://{host}:{port}/  "
               f"(с ноутбука/телефона: http://<IP-Repka>:{port}/)", flush=True)
-        print("Камеры: cam_upper=" + args.device_upper +
-              ", cam_lower=" + args.device_lower, flush=True)
+        print("Камеры: cam_left=" + args.device_left +
+              ", cam_right=" + args.device_right, flush=True)
         if args.fake_cameras:
             print(f"РЕЖИМ ТЕСТОВЫХ КАДРОВ: устройства не открываются; "
                   f"генерация {args.fake_capture_fps:g} к/с.", flush=True)

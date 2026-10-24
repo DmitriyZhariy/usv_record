@@ -5,6 +5,7 @@ import hashlib
 import json
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -191,17 +192,42 @@ def verify(folder, segments):
     return verified, results
 
 
+def prepare_output_folder(args):
+    """Создаёт каталог камеры. Существующий каталог не переиспользуется."""
+    if args.output_dir:
+        folder = Path(args.output_dir).expanduser()
+        folder.mkdir(parents=True, exist_ok=False)
+        return folder
+    root = (Path(args.output_root).expanduser() if args.output_root
+            else Path.home() / "recordings")
+    folder = root / datetime.now(timezone.utc).strftime(
+        f"queued_{args.camera_id}_%Y%m%d_%H%M%S_%f"
+    )
+    folder.mkdir(parents=True, exist_ok=False)
+    return folder
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="/dev/video2")
-    parser.add_argument("--camera-id", choices=("cam_lower", "cam_upper"), default="cam_lower")
+    parser.add_argument("--camera-id", choices=("cam_left", "cam_right"), default="cam_left")
     parser.add_argument("--seconds", type=float, default=35)
     parser.add_argument("--segment-seconds", type=float, default=10)
     parser.add_argument("--queue-frames", type=int, default=120)
     parser.add_argument("--queue-mib", type=int, default=32)
+    parser.add_argument(
+        "--output-root", default=None,
+        help="root for queued_<camera>_<UTC> dirs (default: ~/recordings); "
+             "mutually exclusive with --output-dir")
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="exact output dir for this camera; must not exist yet; "
+             "when set, --output-root is rejected")
     args = parser.parse_args()
     if min(args.seconds, args.segment_seconds, args.queue_frames, args.queue_mib) <= 0:
         parser.error("All limits must be positive")
+    if args.output_dir and args.output_root:
+        parser.error("--output-dir and --output-root are mutually exclusive")
     if not hasattr(av.container.OutputContainer, "add_stream_from_template"):
         raise RuntimeError("Run this script with the tested PyAV 14 environment")
     probe = av.Packet(b"test")
@@ -210,10 +236,16 @@ def main():
     del probe
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    folder = Path.home() / "recordings" / datetime.now(timezone.utc).strftime(
-        f"queued_{args.camera_id}_%Y%m%d_%H%M%S_%f"
-    )
-    folder.mkdir(parents=True, exist_ok=False)
+    try:
+        folder = prepare_output_folder(args)
+    except FileExistsError:
+        print(f"Output directory already exists, refusing to overwrite: "
+              f"{args.output_dir or args.output_root}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"Cannot create output directory: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 1
     report = {
         "status": "starting", "camera_id": args.camera_id, "device": args.device,
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
