@@ -224,7 +224,9 @@ def main():
         help="exact output dir for this camera; must not exist yet; "
              "when set, --output-root is rejected")
     args = parser.parse_args()
-    if min(args.seconds, args.segment_seconds, args.queue_frames, args.queue_mib) <= 0:
+    if args.seconds < 0:
+        parser.error("--seconds must be >= 0 (0 means until operator stop)")
+    if min(args.segment_seconds, args.queue_frames, args.queue_mib) <= 0:
         parser.error("All limits must be positive")
     if args.output_dir and args.output_root:
         parser.error("--output-dir and --output-root are mutually exclusive")
@@ -286,7 +288,8 @@ def main():
             save_json(report_path, report)
             print(f"Recording {args.camera_id}: {args.device}", flush=True)
             print(f"Output: {folder}", flush=True)
-            deadline = time.monotonic() + args.seconds
+            deadline = (time.monotonic() + args.seconds
+                        if args.seconds > 0 else None)
             demuxer = camera.demux(stream)
             packet = None
             try:
@@ -298,7 +301,7 @@ def main():
                     if stop_requested:
                         reason = "user_stop"
                         break
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         reason = "duration_limit"
                         break
                     if packet.size == 0:

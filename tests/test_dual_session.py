@@ -352,6 +352,68 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(right.wait_calls, 1)
 
 
+class DiskMonitorTests(unittest.TestCase):
+    def _verified_children(self):
+        left = FakeProcess(on_terminate=lambda proc: setattr(proc, "returncode", 0))
+        right = FakeProcess(on_terminate=lambda proc: setattr(proc, "returncode", 0))
+        return left, right, [
+            make_child("cam_left", left), make_child("cam_right", right)]
+
+    def test_low_disk_reserve_stops_and_keeps_verified_result(self):
+        left, right, children = self._verified_children()
+        stop = dual.StopFlag()
+
+        result = make_supervisor(
+            stop, FakeClock(), disk_check=lambda: 100.0,
+            critical_free_mib=1024, disk_interval=5.0).run(children)
+
+        self.assertEqual(left.terminate_calls, 1)
+        self.assertEqual(right.terminate_calls, 1)
+        self.assertEqual(result["stop_kind"], "disk")
+        self.assertIn("low_disk_reserve", result["stop_reason"])
+        self.assertIsNone(result["disk_error"])
+        self.assertEqual(dual.exit_code_for(result), 0)
+
+    def test_disk_usage_exception_requests_stop_not_crash(self):
+        left, right, children = self._verified_children()
+        stop = dual.StopFlag()
+
+        def broken():
+            raise OSError("disk disappeared")
+
+        result = make_supervisor(
+            stop, FakeClock(), disk_check=broken,
+            critical_free_mib=1024, disk_interval=5.0).run(children)
+
+        self.assertEqual(left.terminate_calls, 1)
+        self.assertEqual(right.terminate_calls, 1)
+        self.assertEqual(result["stop_kind"], "disk")
+        self.assertIn("disk_check_failed", result["stop_reason"])
+        self.assertIn("disk disappeared", result["disk_error"])
+        self.assertEqual(dual.exit_code_for(result), 0)
+
+    def test_disk_check_is_skipped_after_operator_stop(self):
+        _, _, children = self._verified_children()
+        stop = dual.StopFlag()
+        stop.set("SIGINT", kind="signal")
+        calls = []
+
+        result = make_supervisor(
+            stop, FakeClock(), disk_check=lambda: calls.append(1) or 0.0,
+            critical_free_mib=1024).run(children)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result["stop_reason"], "SIGINT")
+
+
+class SecondsZeroTests(unittest.TestCase):
+    def test_wrapper_accepts_zero_but_rejects_negative(self):
+        options = dual.build_parser().parse_args(["--seconds", "0"])
+        self.assertEqual(options.seconds, 0)
+        self.assertEqual(dual.build_parser().parse_args([]).seconds, 35)
+        self.assertEqual(dual.main(["--seconds", "-1"]), 1)
+
+
 class ExitCodeTests(unittest.TestCase):
     def test_only_two_zero_codes_give_zero(self):
         self.assertEqual(dual.exit_code_for(

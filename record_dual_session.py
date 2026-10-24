@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import errno
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -18,11 +19,16 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import record_preflight as preflight
+
 DEFAULT_OUTPUT_ROOT = "~/recordings"
 DEFAULT_LOCK_FILE = "~/.cache/usv_record/record_dual.lock"
 STOP_GRACE_SECONDS = 35.0
 EXIT_GRACE_SECONDS = 60.0
 POLL_INTERVAL = 0.05
+DEFAULT_MIN_FREE_MIB = 4096
+DEFAULT_CRITICAL_FREE_MIB = 1024
+DISK_CHECK_INTERVAL = 5.0
 
 CAMERAS = (
     {
@@ -46,10 +52,12 @@ class StopFlag:
     def __init__(self):
         self._set = False
         self.reason = None
+        self.kind = None
 
-    def set(self, reason):
+    def set(self, reason, kind="operator"):
         if not self._set:
             self.reason = reason
+            self.kind = kind
         self._set = True
 
     def is_set(self):
@@ -176,13 +184,43 @@ class DualSupervisor:
     def __init__(self, stop_flag, clock=time.monotonic, sleep=time.sleep,
                  stop_grace=STOP_GRACE_SECONDS,
                  exit_grace=EXIT_GRACE_SECONDS,
-                 poll_interval=POLL_INTERVAL):
+                 poll_interval=POLL_INTERVAL,
+                 disk_check=None, critical_free_mib=None,
+                 disk_interval=DISK_CHECK_INTERVAL):
         self.stop_flag = stop_flag
         self.clock = clock
         self.sleep = sleep
         self.stop_grace = stop_grace
         self.exit_grace = exit_grace
         self.poll_interval = poll_interval
+        self.disk_check = disk_check
+        self.critical_free_mib = critical_free_mib
+        self.disk_interval = disk_interval
+        self.last_disk_check = None
+        self.disk_error = None
+
+    def _check_disk(self, now):
+        if self.disk_check is None or self.stop_flag.is_set():
+            return
+        if (self.last_disk_check is not None
+                and now - self.last_disk_check < self.disk_interval):
+            return
+        self.last_disk_check = now
+        try:
+            free_mib = float(self.disk_check())
+        except Exception as exc:
+            self.disk_error = f"{type(exc).__name__}: {exc}"
+            self.stop_flag.set(
+                f"disk_check_failed: {self.disk_error}", kind="disk")
+            return
+        if (self.critical_free_mib is not None
+                and free_mib < self.critical_free_mib):
+            self.stop_flag.set(
+                "low_disk_reserve "
+                f"free_mib={free_mib:.0f} "
+                f"critical_mib={self.critical_free_mib}",
+                kind="disk",
+            )
 
     def _emergency_shutdown(self, children):
         alive = _alive(children)
@@ -209,6 +247,7 @@ class DualSupervisor:
                 if not alive:
                     break
                 now = self.clock()
+                self._check_disk(now)
 
                 if shutdown_started is None:
                     if self.stop_flag.is_set():
@@ -267,6 +306,8 @@ class DualSupervisor:
             "error": error,
             "operator_stop": self.stop_flag.is_set(),
             "stop_reason": self.stop_flag.reason,
+            "stop_kind": self.stop_flag.kind,
+            "disk_error": self.disk_error,
         }
 
 
@@ -305,10 +346,20 @@ def build_parser():
                         help="корень сессий (default: ~/recordings)")
     parser.add_argument("--device-left", default="/dev/video2")
     parser.add_argument("--device-right", default="/dev/video4")
-    parser.add_argument("--seconds", type=float, default=35)
+    parser.add_argument("--seconds", type=float, default=35,
+                        help="жёсткий предел, 0 — до остановки оператором")
     parser.add_argument("--segment-seconds", type=float, default=10)
     parser.add_argument("--queue-frames", type=int, default=120)
     parser.add_argument("--queue-mib", type=int, default=32)
+    parser.add_argument("--min-free-mib", type=int,
+                        default=DEFAULT_MIN_FREE_MIB,
+                        help="отказ в запуске ниже этого запаса (default: 4096)")
+    parser.add_argument("--critical-free-mib", type=int,
+                        default=DEFAULT_CRITICAL_FREE_MIB,
+                        help="штатная остановка ниже этого резерва "
+                             "(default: 1024)")
+    parser.add_argument("--v4l2-ctl", default=preflight.DEFAULT_V4L2_CTL,
+                        help="путь к v4l2-ctl (для проверок и тестов)")
     parser.add_argument("--lock-file", default=DEFAULT_LOCK_FILE,
                         help="lock-файл второго экземпляра wrapper")
     return parser
@@ -316,9 +367,17 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if min(args.seconds, args.segment_seconds,
-           args.queue_frames, args.queue_mib) <= 0:
+    if args.seconds < 0:
+        print("--seconds должен быть >= 0 "
+              "(0 — до остановки оператором)", file=sys.stderr)
+        return 1
+    if min(args.segment_seconds, args.queue_frames, args.queue_mib) <= 0:
         print("Все ограничения должны быть > 0", file=sys.stderr)
+        return 1
+    if (args.min_free_mib <= 0 or args.critical_free_mib <= 0
+            or args.critical_free_mib >= args.min_free_mib):
+        print("Требуется 0 < --critical-free-mib < --min-free-mib",
+              file=sys.stderr)
         return 1
 
     recorder = Path(__file__).resolve().with_name("record_camera_pyav_queue.py")
@@ -347,13 +406,34 @@ def main(argv=None):
     stop_flag = StopFlag()
 
     def handle_signal(signum, frame):
-        stop_flag.set(signal.Signals(signum).name)
+        stop_flag.set(signal.Signals(signum).name, kind="signal")
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
     exit_code = 1
     try:
+        devices = [args.device_left, args.device_right]
+        try:
+            report = preflight.run_preflight(
+                args.output_root, devices,
+                min_free_mib=args.min_free_mib,
+                critical_free_mib=args.critical_free_mib,
+                v4l2_ctl=args.v4l2_ctl,
+            )
+        except (preflight.PreflightError, OSError) as exc:
+            print(f"Preflight failed: {exc}", file=sys.stderr)
+            return 1
+
+        space = report["space"]
+        print("Preflight: exposure_dynamic_framerate=0 подтверждён на "
+              + ", ".join(item["device"] for item in report["cameras"]),
+              flush=True)
+        print(f"Preflight: свободно {space['free_mib']:.0f} MiB "
+              f"(порог запуска {args.min_free_mib} MiB, "
+              f"критический резерв {args.critical_free_mib} MiB)",
+              flush=True)
+
         try:
             session = create_session(args.output_root)
         except OSError as exc:
@@ -383,14 +463,25 @@ def main(argv=None):
                   file=sys.stderr)
             return 1
 
-        result = DualSupervisor(stop_flag).run(children)
+        output_root = Path(args.output_root).expanduser()
+        supervisor = DualSupervisor(
+            stop_flag,
+            disk_check=lambda: (
+                shutil.disk_usage(str(output_root)).free / preflight.MIB),
+            critical_free_mib=args.critical_free_mib,
+        )
+        result = supervisor.run(children)
         exit_code = exit_code_for(result)
 
         for child in children:
             print(f"{child.key}: код {result['codes'].get(child.key)}; "
                   f"лог: {child.log_path}", flush=True)
-        if result["operator_stop"]:
-            print(f"Остановка оператором: {result['stop_reason']}", flush=True)
+        if result.get("stop_kind") == "disk":
+            print(f"Stop reason: {result['stop_reason']}", flush=True)
+        elif result["operator_stop"]:
+            label = ("Остановка по сигналу" if result.get("stop_kind") == "signal"
+                     else "Остановка оператором")
+            print(f"{label}: {result['stop_reason']}", flush=True)
         if result["forced"]:
             print("Принудительное завершение процессов.", file=sys.stderr)
         if result["error"]:
