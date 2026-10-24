@@ -426,7 +426,8 @@ def main(argv=None):
             return 1
 
         space = report["space"]
-        print("Preflight: exposure_dynamic_framerate=0 подтверждён на "
+        print("Preflight: exposure_dynamic_framerate=0 установлен и "
+              "подтверждён на "
               + ", ".join(item["device"] for item in report["cameras"]),
               flush=True)
         print(f"Preflight: свободно {space['free_mib']:.0f} MiB "

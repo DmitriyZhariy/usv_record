@@ -3,6 +3,9 @@
 
 Проверки не зависят от PyAV и от HTTP-панели: их вызывает wrapper
 record_dual_session.py, поэтому прямой запуск из CLI не обходит их.
+Перед созданием сессии preflight устанавливает
+exposure_dynamic_framerate=0 на обеих камерах и читает значение
+обратно; остальные настройки камер не изменяются.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ def _default_runner(argv, timeout):
         text=True,
         timeout=timeout,
         check=False,
+        shell=False,
     )
 
 
@@ -59,12 +63,22 @@ def _invoke(argv, runner, timeout=COMMAND_TIMEOUT_S):
     return stdout + stderr
 
 
-def verify_exposure(device, v4l2_ctl=DEFAULT_V4L2_CTL, runner=None):
-    """Читает exposure_dynamic_framerate и требует 0.
+def set_exposure(device, v4l2_ctl=DEFAULT_V4L2_CTL, runner=None):
+    """Устанавливает exposure_dynamic_framerate=0.
 
-    Настройка камеры не изменяется: при ненулевом значении preflight
-    завершается ошибкой с командой для оператора.
+    Другие настройки камеры не изменяются.
     """
+    runner = runner or _default_runner
+    set_argv = [
+        str(v4l2_ctl), "-d", str(device),
+        f"--set-ctrl={EXPOSURE_CONTROL}=0",
+    ]
+    _invoke(set_argv, runner)
+    return {"device": str(device), EXPOSURE_CONTROL: 0}
+
+
+def verify_exposure(device, v4l2_ctl=DEFAULT_V4L2_CTL, runner=None):
+    """Читает exposure_dynamic_framerate обратно и требует 0."""
     runner = runner or _default_runner
     get_argv = [
         str(v4l2_ctl), "-d", str(device),
@@ -79,9 +93,8 @@ def verify_exposure(device, v4l2_ctl=DEFAULT_V4L2_CTL, runner=None):
     value = int(match.group(1))
     if value != 0:
         raise PreflightError(
-            f"{device}: {EXPOSURE_CONTROL}={value}, требуется 0. "
-            f"Отключите: {v4l2_ctl} -d {device} "
-            f"--set-ctrl={EXPOSURE_CONTROL}=0")
+            f"{device}: после установки {EXPOSURE_CONTROL}={value}, "
+            f"требуется 0")
     return {"device": str(device), EXPOSURE_CONTROL: value}
 
 
@@ -180,7 +193,12 @@ def ensure_output_root(root, min_free_mib, usage=None):
 def run_preflight(output_root, devices, min_free_mib,
                   critical_free_mib=None, v4l2_ctl=DEFAULT_V4L2_CTL,
                   runner=None, usage=None, proc_root="/proc"):
-    """Полная проверка перед созданием сессии и запуском рекордеров."""
+    """Полная проверка перед созданием сессии и запуском рекордеров.
+
+    Порядок: путь и место, доступность устройств, установка
+    exposure_dynamic_framerate=0 на обеих камерах, чтение обратно.
+    Любая ошибка запрещает запуск записи обеих камер.
+    """
     if critical_free_mib is not None:
         if critical_free_mib <= 0:
             raise PreflightError("критический резерв должен быть > 0")
@@ -190,13 +208,18 @@ def run_preflight(output_root, devices, min_free_mib,
 
     space = ensure_output_root(output_root, min_free_mib, usage=usage)
 
-    checked = []
     for device in devices:
         holders = find_device_holders(device, proc_root=proc_root)
         if holders:
             raise PreflightError(
                 f"{device}: устройство уже открыто процессами "
                 f"{holders}; остановите просмотр/запись")
+
+    for device in devices:
+        set_exposure(device, v4l2_ctl=v4l2_ctl, runner=runner)
+
+    checked = []
+    for device in devices:
         checked.append(verify_exposure(
             device, v4l2_ctl=v4l2_ctl, runner=runner))
 

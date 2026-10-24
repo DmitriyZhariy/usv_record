@@ -1,6 +1,7 @@
 """Проверки preflight без камер, PyAV и v4l2-ctl."""
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,18 +24,34 @@ class FakeCompleted:
 
 
 class FakeRunner:
-    def __init__(self, answers):
-        self.answers = answers
+    def __init__(self, answers=None):
+        self.answers = answers or {}
         self.calls = []
 
-    def __call__(self, argv, timeout=None):
-        self.calls.append((list(argv), timeout))
-        if "--get-ctrl=exposure_dynamic_framerate" not in argv:
-            raise AssertionError(f"unexpected command: {argv}")
-        answer = self.answers.get("get", FakeCompleted())
+    def _answer(self, kind, device):
+        default = get_answer(0) if kind == "get" else FakeCompleted()
+        answer = self.answers.get(kind, default)
+        if isinstance(answer, dict):
+            answer = answer.get(device, default)
         if isinstance(answer, Exception):
             raise answer
         return answer
+
+    def __call__(self, argv, timeout=None):
+        self.calls.append((list(argv), timeout))
+        device = argv[argv.index("-d") + 1]
+        if f"--set-ctrl={preflight.EXPOSURE_CONTROL}=0" in argv:
+            kind = "set"
+        elif f"--get-ctrl={preflight.EXPOSURE_CONTROL}" in argv:
+            kind = "get"
+        else:
+            raise AssertionError(f"unexpected command: {argv}")
+        return self._answer(kind, device)
+
+
+def get_answer(value):
+    return FakeCompleted(
+        0, f"{preflight.EXPOSURE_CONTROL}: {value}\n")
 
 
 def usage_with_free(free_mib):
@@ -44,10 +61,35 @@ def usage_with_free(free_mib):
 
 
 class ExposureTests(unittest.TestCase):
-    def test_reads_zero_without_changing_camera(self):
+    def test_set_changes_only_exposure_control(self):
+        runner = FakeRunner()
+        result = preflight.set_exposure("/dev/video2", runner=runner)
+        self.assertEqual(result["exposure_dynamic_framerate"], 0)
+        self.assertEqual(len(runner.calls), 1)
+        argv, timeout = runner.calls[0]
+        self.assertIn("--set-ctrl=exposure_dynamic_framerate=0", argv)
+        self.assertEqual(
+            [item for item in argv
+             if str(item).startswith("--set-ctrl")],
+            ["--set-ctrl=exposure_dynamic_framerate=0"])
+        self.assertEqual(timeout, preflight.COMMAND_TIMEOUT_S)
+
+    def test_set_failure_is_rejected(self):
         runner = FakeRunner({
-            "get": FakeCompleted(0, "exposure_dynamic_framerate: 0\n"),
+            "set": FakeCompleted(1, "", "cannot set control"),
         })
+        with self.assertRaises(preflight.PreflightError) as caught:
+            preflight.set_exposure("/dev/video2", runner=runner)
+        self.assertIn("cannot set control", str(caught.exception))
+
+    def test_set_timeout_is_rejected(self):
+        runner = FakeRunner({"set": subprocess.TimeoutExpired("v4l2-ctl", 5)})
+        with self.assertRaises(preflight.PreflightError) as caught:
+            preflight.set_exposure("/dev/video2", runner=runner)
+        self.assertIn("таймаут", str(caught.exception))
+
+    def test_read_back_zero_is_accepted(self):
+        runner = FakeRunner({"get": get_answer(0)})
         result = preflight.verify_exposure("/dev/video2", runner=runner)
         self.assertEqual(result["exposure_dynamic_framerate"], 0)
         self.assertEqual(len(runner.calls), 1)
@@ -57,15 +99,12 @@ class ExposureTests(unittest.TestCase):
             any(str(item).startswith("--set-ctrl")
                 for item in argv) for argv, _ in runner.calls))
 
-    def test_read_back_nonzero_is_rejected_with_command(self):
-        runner = FakeRunner({
-            "get": FakeCompleted(0, "exposure_dynamic_framerate: 1\n"),
-        })
+    def test_read_back_nonzero_is_rejected(self):
+        runner = FakeRunner({"get": get_answer(1)})
         with self.assertRaises(preflight.PreflightError) as caught:
             preflight.verify_exposure("/dev/video2", runner=runner)
+        self.assertIn("после установки", str(caught.exception))
         self.assertIn("требуется 0", str(caught.exception))
-        self.assertIn("--set-ctrl=exposure_dynamic_framerate=0",
-                      str(caught.exception))
 
     def test_command_failure_is_rejected(self):
         runner = FakeRunner({
@@ -75,9 +114,9 @@ class ExposureTests(unittest.TestCase):
             preflight.verify_exposure("/dev/video2", runner=runner)
 
     def test_missing_v4l2_ctl_is_rejected(self):
-        runner = FakeRunner({"get": FileNotFoundError("v4l2-ctl")})
+        runner = FakeRunner({"set": FileNotFoundError("v4l2-ctl")})
         with self.assertRaises(preflight.PreflightError) as caught:
-            preflight.verify_exposure(
+            preflight.set_exposure(
                 "/dev/video2", v4l2_ctl="/missing/v4l2-ctl", runner=runner)
         self.assertIn("v4l2-ctl", str(caught.exception))
 
@@ -144,11 +183,9 @@ class HolderTests(unittest.TestCase):
 
 class RunPreflightTests(unittest.TestCase):
     def _runner(self):
-        return FakeRunner({
-            "get": FakeCompleted(0, "exposure_dynamic_framerate: 0\n"),
-        })
+        return FakeRunner()
 
-    def test_success_checks_both_cameras_without_changing_controls(self):
+    def test_success_sets_then_reads_both_cameras(self):
         with tempfile.TemporaryDirectory() as temp:
             runner = self._runner()
             report = preflight.run_preflight(
@@ -157,8 +194,57 @@ class RunPreflightTests(unittest.TestCase):
                 runner=runner, usage=lambda path: usage_with_free(500),
                 proc_root=str(Path(temp) / "empty-proc"))
             self.assertEqual(len(report["cameras"]), 2)
-            self.assertEqual(len(runner.calls), 2)
+            commands = [
+                (("set" if any(str(item).startswith("--set-ctrl")
+                               for item in argv) else "get"),
+                 argv[argv.index("-d") + 1])
+                for argv, _ in runner.calls
+            ]
+            self.assertEqual(commands, [
+                ("set", "/dev/video2"), ("set", "/dev/video4"),
+                ("get", "/dev/video2"), ("get", "/dev/video4"),
+            ])
+            self.assertTrue(all(
+                timeout == preflight.COMMAND_TIMEOUT_S
+                for _, timeout in runner.calls))
             self.assertEqual(report["space"]["free_mib"], 500.0)
+
+    def test_set_failure_blocks_both_cameras_before_read_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runner = FakeRunner({
+                "set": {
+                    "/dev/video2": FakeCompleted(),
+                    "/dev/video4": FakeCompleted(1, "", "device busy"),
+                },
+            })
+            with self.assertRaises(preflight.PreflightError):
+                preflight.run_preflight(
+                    temp, ["/dev/video2", "/dev/video4"],
+                    min_free_mib=100, critical_free_mib=10,
+                    runner=runner, usage=lambda path: usage_with_free(500),
+                    proc_root=str(Path(temp) / "empty-proc"))
+            kinds = [
+                "set" if any(str(item).startswith("--set-ctrl")
+                             for item in argv) else "get"
+                for argv, _ in runner.calls
+            ]
+            self.assertEqual(kinds, ["set", "set"])
+
+    def test_nonzero_read_back_blocks_recording(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runner = FakeRunner({
+                "get": {
+                    "/dev/video2": get_answer(0),
+                    "/dev/video4": get_answer(1),
+                },
+            })
+            with self.assertRaises(preflight.PreflightError) as caught:
+                preflight.run_preflight(
+                    temp, ["/dev/video2", "/dev/video4"],
+                    min_free_mib=100, critical_free_mib=10,
+                    runner=runner, usage=lambda path: usage_with_free(500),
+                    proc_root=str(Path(temp) / "empty-proc"))
+            self.assertIn("/dev/video4", str(caught.exception))
 
     def test_busy_device_blocks_before_exposure(self):
         with tempfile.TemporaryDirectory() as temp:
