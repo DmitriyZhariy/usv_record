@@ -42,6 +42,71 @@
 - Общего `session.json` в корне сессии нет.
 - Старые записи не читаются, не переименовываются и не удаляются.
 
+## Профили MJPG: этап CLI
+
+В `record_profiles.py` согласованы семь режимов:
+`1920x1080@60`, `1280x720@60`, `1280x720@30`,
+`800x600@60`, `800x600@30`, `640x480@60`, `640x480@30`.
+YUYV не реализован. Перечень задаёт варианты CLI; он сам по себе
+не подтверждает поддержку и устойчивую работу двух камер.
+
+Пример wrapper для обеих камер (Linux на Repka, после ручной приёмки):
+
+```bash
+$HOME/recorder/venv-pyav14/bin/python \
+  $HOME/recorder/record_dual_session.py \
+  --width 1280 --height 720 --fps 30 \
+  --exposure-dynamic-framerate 1 --seconds 20
+```
+
+Wrapper проверяет место и занятость устройств, затем заявленную поддержку
+режима MJPG на обеих камерах. После этого устанавливает выбранный dynamic
+на обеих камерах и читает обратно. Только затем создаётся каталог сессии.
+Проверка списка форматов поддерживает Discrete и допуск округления FPS
+0.5 кадра/с. Stepwise/Continuous означает ограничение парсера:
+поддержка не подтверждена. Допуск относится к ответу драйвера, а не к
+пользовательскому запросу: `--fps 59.8` не подменяется значением 60.
+
+Каждый рекордер дополнительно читает dynamic перед созданием своего
+каталога и отказывает при несовпадении. При прямом запуске одной камеры
+сначала самостоятельно установите нужное значение, например:
+
+```bash
+v4l2-ctl -d /dev/video2 --set-ctrl=exposure_dynamic_framerate=1
+$HOME/recorder/venv-pyav14/bin/python \
+  $HOME/recorder/record_camera_pyav_queue.py \
+  --camera-id cam_left --device /dev/video2 \
+  --width 1280 --height 720 --fps 30 \
+  --exposure-dynamic-framerate 1 --seconds 20
+```
+
+`--v4l2-ctl` позволяет wrapper и прямому рекордеру использовать
+нестандартный путь команды. Wrapper передаёт этот путь обоим рекордерам.
+
+Defaults CLI сохранены: 1280x720@60, dynamic=0, 35 секунд.
+`--seconds 0` — до штатной остановки; допустимы также произвольные
+конечные неотрицательные длительности, например 20 секунд.
+
+Dynamic=1 разрешает снижение частоты, но не требует его и не гарантирует
+увеличения яркости. Низкий измеренный FPS сам по себе не является
+ошибкой целостности. Метаданные содержат `profile`, `requested_mode`,
+`negotiated_mode`, `confirmed_camera_controls` и `measured_capture_fps`.
+Номинальный FPS в `negotiated_mode.fps` пока `null`: не подтверждён
+независимым чтением драйвера. Измеренный темп считается по принятым
+пакетам `(N-1)/(t_last-t_first)`; это не время экспозиции и не
+подтверждение отсутствия потерь до приложения. Старые поля сохранены.
+
+Этот этап завершает только нижние слои и их тесты. Выбор профиля
+через веб-панель пока НЕ подключён. Нельзя объявлять текущий интерфейс
+полной реализацией задачи. Shell-тест остаётся приёмкой контрольного
+режима 1280x720@60 с dynamic=0, а не остальных режимов.
+
+Аппаратная приёмка: сначала 720p60 dynamic=0, затем при том же освещении
+720p60 dynamic=1, затем 720p30 и нужные оператору режимы. Для каждого
+проверить обе камеры, метаданные, verified, изображение, измеренный темп
+и расход места. Автотесты используют заглушки и не проверяют USB,
+V4L2, реальный PyAV/Matroska или производительность Repka.
+
 ## Запуск на Repka
 
 Остановите просмотр: просмотр и запись — взаимоисключающие режимы.
@@ -178,7 +243,7 @@
 удалённого пути:
 
     scp record_camera_pyav_queue.py record_dual_session.py `
-        record_preflight.py preview_dual_mjpeg.py `
+        record_preflight.py record_profiles.py preview_dual_mjpeg.py `
         control_panel.py panel_page.py `
         test_dual_pyav_queue.sh PREVIEW.md RECORDING.md PANEL.md `
         '<user>@<repka-ip>:~/recorder/'
@@ -190,7 +255,7 @@
 ## Локальные проверки
 
     python -m compileall record_camera_pyav_queue.py record_dual_session.py \
-      record_preflight.py preview_dual_mjpeg.py control_panel.py \
+      record_preflight.py record_profiles.py preview_dual_mjpeg.py control_panel.py \
       panel_page.py tests
     python -m unittest discover -s tests -v
     bash -n test_dual_pyav_queue.sh

@@ -40,6 +40,11 @@ class FakeRunner:
     def __call__(self, argv, timeout=None):
         self.calls.append((list(argv), timeout))
         device = argv[argv.index("-d") + 1]
+        if "--list-formats-ext" in argv:
+            return FakeCompleted(stdout=(
+                "[0]: 'MJPG' (Motion-JPEG)\n"
+                "    Size: Discrete 1280x720\n"
+                "        Interval: Discrete 0.017s (60.000 fps)\n"))
         if f"--set-ctrl={preflight.EXPOSURE_CONTROL}=0" in argv:
             kind = "set"
         elif f"--get-ctrl={preflight.EXPOSURE_CONTROL}" in argv:
@@ -199,6 +204,7 @@ class RunPreflightTests(unittest.TestCase):
                                for item in argv) else "get"),
                  argv[argv.index("-d") + 1])
                 for argv, _ in runner.calls
+                if "--list-formats-ext" not in argv
             ]
             self.assertEqual(commands, [
                 ("set", "/dev/video2"), ("set", "/dev/video4"),
@@ -227,6 +233,7 @@ class RunPreflightTests(unittest.TestCase):
                 "set" if any(str(item).startswith("--set-ctrl")
                              for item in argv) else "get"
                 for argv, _ in runner.calls
+                if "--list-formats-ext" not in argv
             ]
             self.assertEqual(kinds, ["set", "set"])
 

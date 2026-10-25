@@ -31,7 +31,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-CAPTURE_OPTIONS = {"input_format": "mjpeg", "video_size": "1280x720", "framerate": "60"}
+import record_profiles
+
+CAPTURE_OPTIONS = record_profiles.capture_options(
+    record_profiles.get_mode(record_profiles.DEFAULT_MODE))
 STREAM_BOUNDARY = "usvframe"
 STREAM_WRITE_TIMEOUT_S = 5.0
 STREAM_SNDBUF_BYTES = 64 * 1024
@@ -606,10 +609,14 @@ def _rate(times):
 
 
 class CameraRuntime:
-    def __init__(self, key, label, device):
+    def __init__(self, key, label, device, capture_mode=None, fake_mode=False):
         self.key = key
         self.label = label
         self.device = device
+        self.capture_mode = dict(
+            capture_mode
+            or record_profiles.get_mode(record_profiles.DEFAULT_MODE))
+        self.fake_mode = fake_mode
         self.latest = LatestFrame()
         self._lock = threading.Lock()
         self.state = "starting"
@@ -660,6 +667,11 @@ class CameraRuntime:
                 age = max(0.0, now - self._last_publish_mono)
             capture_rate = _rate(self._packet_times)
             publish_rate = _rate(self._publish_times)
+            matches = None
+            if (self.mode is not None and not self.fake_mode):
+                matches = record_profiles.mode_matches(
+                    self.capture_mode, self.mode.get("codec"),
+                    self.mode.get("width"), self.mode.get("height"))
             return {
                 "key": self.key,
                 "label": self.label,
@@ -668,6 +680,10 @@ class CameraRuntime:
                 "error": self.error,
                 "last_error": self.last_error,
                 "mode": self.mode,
+                "capture_mode_requested": dict(self.capture_mode),
+                "capture_fps_requested": self.capture_mode["fps"],
+                "nominal_fps": None,
+                "mode_matches_requested": matches,
                 "received_packets": self.received_packets,
                 "published_frames": self.published_frames,
                 "rejected_packets": self.rejected_packets,
@@ -682,17 +698,25 @@ class CameraRuntime:
 
 
 class PreviewApp:
-    def __init__(self, devices, fps, max_clients, fake_cameras, fake_capture_fps):
+    def __init__(self, devices, fps, max_clients, fake_cameras, fake_capture_fps,
+                 capture_mode=None):
         self.fps = fps
         self.max_clients = max_clients
         self.fake_cameras = fake_cameras
         self.fake_capture_fps = fake_capture_fps
+        self.capture_mode = dict(
+            capture_mode
+            or record_profiles.get_mode(record_profiles.DEFAULT_MODE))
+        self.capture_options = record_profiles.capture_options(
+            self.capture_mode)
         self.stop_event = threading.Event()
         self.stop_reason = None
         self.started_at_utc = datetime.now(timezone.utc).isoformat()
         self.started_mono = time.monotonic()
         self.cameras = {
-            spec["key"]: CameraRuntime(spec["key"], spec["label"], devices[spec["key"]])
+            spec["key"]: CameraRuntime(
+                spec["key"], spec["label"], devices[spec["key"]],
+                capture_mode=self.capture_mode, fake_mode=fake_cameras)
             for spec in CAMERA_SPECS
         }
         self._threads = {}
@@ -754,6 +778,8 @@ class PreviewApp:
             "host": host,
             "port": port,
             "fps_target": self.fps,
+            "capture_fps_requested": self.capture_mode["fps"],
+            "capture_mode_requested": dict(self.capture_mode),
             "fake_cameras": self.fake_cameras,
             "max_clients": self.max_clients,
             "clients_total": self.clients_total,
@@ -828,7 +854,11 @@ def fake_capture(app, runtime):
     last_publish = None
     next_at = time.monotonic()
     runtime.set_state("running")
-    runtime.mode = {"codec": "fake-jpeg", "width": 256, "height": 144}
+    runtime.mode = {
+        "codec": "fake-jpeg",
+        "width": app.capture_mode["width"],
+        "height": app.capture_mode["height"],
+    }
     try:
         while not app.stop_event.is_set():
             now = time.monotonic()
@@ -864,7 +894,7 @@ def v4l2_capture(app, runtime):
         import av  # лениво: модуль импортируем без PyAV
 
         container = av.open(runtime.device, format="v4l2",
-                            options=dict(CAPTURE_OPTIONS))
+                            options=dict(app.capture_options))
         stream = container.streams.video[0]
         context = stream.codec_context
         runtime.mode = {
@@ -872,9 +902,14 @@ def v4l2_capture(app, runtime):
             "width": context.width,
             "height": context.height,
         }
-        if context.name != "mjpeg":
+        if not record_profiles.mode_matches(
+                app.capture_mode, context.name, context.width,
+                context.height):
             raise RuntimeError(
-                f"камера согласовала {context.name!r}, ожидался mjpeg")
+                f"камера согласовала {context.name} "
+                f"{context.width}x{context.height}, запрошено "
+                f"{app.capture_mode['format']} "
+                f"{app.capture_mode['width']}x{app.capture_mode['height']}")
         runtime.set_state("running")
         print(f"{runtime.key}: {runtime.device} открыта, "
               f"{context.name} {context.width}x{context.height}", flush=True)

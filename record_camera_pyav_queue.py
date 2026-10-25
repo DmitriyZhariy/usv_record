@@ -15,6 +15,9 @@ from pathlib import Path
 
 import av
 
+import record_profiles
+import record_preflight as preflight
+
 stop_requested = False
 
 
@@ -212,6 +215,17 @@ def main():
     parser.add_argument("--device", default="/dev/video2")
     parser.add_argument("--camera-id", choices=("cam_left", "cam_right"), default="cam_left")
     parser.add_argument("--seconds", type=float, default=35)
+    parser.add_argument("--width", type=int, default=1280,
+                        help="ширина MJPG-кадра (по умолчанию 1280)")
+    parser.add_argument("--height", type=int, default=720,
+                        help="высота MJPG-кадра (по умолчанию 720)")
+    parser.add_argument("--fps", type=float, default=60,
+                        help="запрашиваемый FPS (по умолчанию 60)")
+    parser.add_argument("--exposure-dynamic-framerate", type=int,
+                        choices=(0, 1), default=0,
+                        help="0 — снижение частоты запрещено, 1 — разрешено")
+    parser.add_argument("--v4l2-ctl", default=preflight.DEFAULT_V4L2_CTL,
+                        help="путь к v4l2-ctl для проверки dynamic")
     parser.add_argument("--segment-seconds", type=float, default=10)
     parser.add_argument("--queue-frames", type=int, default=120)
     parser.add_argument("--queue-mib", type=int, default=32)
@@ -226,6 +240,16 @@ def main():
     args = parser.parse_args()
     if args.seconds < 0:
         parser.error("--seconds must be >= 0 (0 means until operator stop)")
+    if args.width <= 0 or args.height <= 0:
+        parser.error("--width and --height must be positive")
+    if args.fps <= 0:
+        parser.error("--fps must be positive")
+    try:
+        mode = record_profiles.resolve_mode(args.width, args.height, args.fps)
+        profile = record_profiles.make_profile(
+            mode["mode"], args.exposure_dynamic_framerate, args.seconds)
+    except record_profiles.ProfileError as exc:
+        parser.error(str(exc))
     if min(args.segment_seconds, args.queue_frames, args.queue_mib) <= 0:
         parser.error("All limits must be positive")
     if args.output_dir and args.output_root:
@@ -238,6 +262,13 @@ def main():
     del probe
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
+    try:
+        confirmed_exposure = preflight.verify_exposure(
+            args.device, expected=args.exposure_dynamic_framerate,
+            v4l2_ctl=args.v4l2_ctl)
+    except preflight.PreflightError as exc:
+        print(f"Preflight failed: {exc}", file=sys.stderr)
+        return 1
     try:
         folder = prepare_output_folder(args)
     except FileExistsError:
@@ -252,7 +283,14 @@ def main():
         "status": "starting", "camera_id": args.camera_id, "device": args.device,
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "pyav_version": av.__version__, "ffmpeg_libraries": av.library_versions,
-        "requested_mode": {"format": "mjpeg", "width": 1280, "height": 720, "fps": 60},
+        "requested_mode": {
+            "format": mode["format"], "width": mode["width"],
+            "height": mode["height"], "fps": mode["fps"],
+        },
+        "profile": record_profiles.profile_details(profile),
+        "confirmed_camera_controls": confirmed_exposure,
+        "negotiated_mode": None,
+        "measured_capture_fps": None,
         "timestamp_policy": "host_receive_monotonic_ns_in_index; local_video_pts_floor_to_ms",
         "timestamp_is_exposure_time": False,
         "source_timestamp_policy": "preserve_original_pts_dts_time_base_in_index",
@@ -270,14 +308,27 @@ def main():
     worker = None
     reason = "unknown"
     capture_error = None
+    first_packet_ns = None
+    last_packet_ns = None
 
     try:
-        options = {"input_format": "mjpeg", "video_size": "1280x720", "framerate": "60"}
+        options = record_profiles.capture_options(mode)
         with av.open(args.device, format="v4l2", options=options) as camera:
             stream = camera.streams.video[0]
             context = stream.codec_context
-            if context.name != "mjpeg" or (context.width, context.height) != (1280, 720):
-                raise RuntimeError("Camera negotiated an unexpected mode")
+            report["negotiated_mode"] = {
+                "codec": context.name,
+                "width": context.width,
+                "height": context.height,
+                "fps": None,
+            }
+            if not record_profiles.mode_matches(
+                    mode, context.name, context.width, context.height):
+                raise RuntimeError(
+                    "Camera negotiated an unexpected mode: "
+                    f"{context.name} {context.width}x{context.height}, "
+                    f"requested {mode['format']} "
+                    f"{mode['width']}x{mode['height']}")
             worker = threading.Thread(
                 target=write_packets,
                 args=(buffer, capture_done, writer_failed, stream, folder, args, result),
@@ -325,6 +376,9 @@ def main():
                         report["rejected_frame_id"] = item["frame_id"]
                         raise RuntimeError("Queue overflow: recording stopped, no silent dropping")
                     report["accepted_packets"] += 1
+                    if first_packet_ns is None:
+                        first_packet_ns = mono_ns
+                    last_packet_ns = mono_ns
                     item = None
                 else:
                     raise RuntimeError("Camera stream ended unexpectedly")
@@ -353,6 +407,8 @@ def main():
             report["writer"] = result
         else:
             report["writer_result_unavailable"] = True
+        report["measured_capture_fps"] = record_profiles.measured_rate(
+            first_packet_ns, last_packet_ns, report["accepted_packets"])
         report["status"] = "failed"
         save_json(report_path, report)
 

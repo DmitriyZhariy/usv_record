@@ -34,6 +34,9 @@ PANEL_HTML = """<!doctype html>
   button:hover:not(:disabled) { background: #25394b; }
   button.danger { background: #48201f; border-color: #8f3c3a; }
   button:disabled { opacity: 0.45; cursor: default; }
+  select { max-width: 100%; background: #0d1115; color: #e6edf3;
+           border: 1px solid #3a4754; border-radius: 6px; padding: 7px 8px; }
+  label { display: flex; gap: 6px; align-items: center; font-size: 13px; }
   input { background: #0d1115; color: #e6edf3; border: 1px solid #3a4754;
           border-radius: 6px; padding: 7px 8px; font-size: 14px; }
   #message { color: #cfdae4; font-size: 14px; min-height: 1.3em; }
@@ -102,6 +105,28 @@ PANEL_HTML = """<!doctype html>
     <p id="conflicts" class="warning"></p>
   </section>
 
+  <section class="panel" id="profile-panel">
+    <h2>Профиль обеих камер · MJPG</h2>
+    <form id="profile-form" class="row">
+      <label>Режим <select id="profile-mode" disabled></select></label>
+      <label>Dynamic <select id="profile-dynamic" disabled>
+        <option value="0">0 — не снижать частоту</option>
+        <option value="1">1 — разрешить снижение частоты</option>
+      </select></label>
+      <label>Длительность <select id="profile-duration" disabled></select></label>
+      <button id="profile-apply" type="submit" disabled>Применить профиль</button>
+      <button id="profile-check" type="button" disabled>Проверить режимы</button>
+    </form>
+    <p id="profile-current" class="muted"></p>
+    <p id="profile-support" class="muted"></p>
+    <p id="profile-feedback" role="status" aria-live="polite"></p>
+    <pre id="profile-reasons"></pre>
+    <p class="muted">Изменять профиль можно только после остановки просмотра и записи.
+      Применение сохраняет выбор в памяти панели, но не открывает камеры.
+      Dynamic=1 разрешает, но не гарантирует снижение FPS или увеличение яркости.
+      FPS передачи просмотра не равен FPS захвата. После перезапуска выбор сбрасывается.</p>
+  </section>
+
   <section class="panel">
     <h2>Состояние</h2>
     <div class="kv" id="record-info"></div>
@@ -139,6 +164,10 @@ const TOKEN_KEY = "usvPanelToken";
 let token = localStorage.getItem(TOKEN_KEY) || "";
 let lastStatus = null;
 let busy = false;
+let profileDirty = false;
+let profileServerKey = "";
+let profileOptionsKey = "";
+let profileDurationsKey = "";
 const streams = {};
 const cards = {};
 
@@ -255,12 +284,126 @@ async function post(command) {
       body: "{}",
     });
   } catch (error) {
-    setMessage(error.message, true);
+    if (command.startsWith("profile/")) profileFeedback(error.message, true);
+    else setMessage(error.message, true);
   } finally {
     busy = false;
     refresh();
   }
 }
+
+function profileReady(status) {
+  if (!status || !status.profile) return false;
+  const support = status.profile_support || {};
+  return ["ok", "fake"].includes(support.state) &&
+    (status.profile_options || []).some(
+      (option) => option.mode === status.profile.mode && option.supported);
+}
+
+function profileFeedback(text, error) {
+  const node = document.getElementById("profile-feedback");
+  node.textContent = text || "";
+  node.className = error ? "warning" : "muted";
+}
+
+function renderProfile(status) {
+  const mode = document.getElementById("profile-mode");
+  const dynamic = document.getElementById("profile-dynamic");
+  const duration = document.getElementById("profile-duration");
+  const profile = status && status.profile;
+  const options = (status && status.profile_options) || [];
+  const support = (status && status.profile_support) || {};
+  const optionsKey = JSON.stringify(options);
+  if (optionsKey !== profileOptionsKey) {
+    const selected = mode.value;
+    mode.textContent = "";
+    for (const item of options) {
+      const option = el("option", "", item.mode + (item.supported ? "" : " — не подтверждён"));
+      option.value = item.mode;
+      option.disabled = !item.supported;
+      mode.append(option);
+    }
+    if (options.some((item) => item.mode === selected)) mode.value = selected;
+    profileOptionsKey = optionsKey;
+  }
+  const durations = ((status && status.profile_durations) || []).slice();
+  if (profile && !durations.includes(profile.duration_seconds)) durations.push(profile.duration_seconds);
+  const durationsKey = JSON.stringify(durations);
+  if (durationsKey !== profileDurationsKey) {
+    const selected = duration.value;
+    duration.textContent = "";
+    for (const seconds of durations) {
+      const option = el("option", "", seconds === 0 ? "До остановки" : fmtDuration(seconds));
+      option.value = String(seconds);
+      duration.append(option);
+    }
+    if (durations.some((seconds) => String(seconds) === selected)) duration.value = selected;
+    profileDurationsKey = durationsKey;
+  }
+  const serverKey = JSON.stringify(profile);
+  if (profile && (!profileDirty || serverKey !== profileServerKey)) {
+    mode.value = profile.mode;
+    dynamic.value = String(profile.exposure_dynamic_framerate);
+    duration.value = String(profile.duration_seconds);
+    if (profileDirty && serverKey !== profileServerKey) {
+      profileFeedback("Профиль изменён в другой вкладке; показан текущий выбор.", false);
+    }
+    profileDirty = false;
+  }
+  profileServerKey = serverKey;
+  const locked = !status || status.profile_locked || busy;
+  for (const node of [mode, dynamic, duration]) node.disabled = locked;
+  const selected = options.find((item) => item.mode === mode.value);
+  document.getElementById("profile-apply").disabled = locked || !profileDirty ||
+    !["ok", "fake"].includes(support.state) || !selected || !selected.supported;
+  document.getElementById("profile-check").disabled = locked || support.state === "checking";
+  document.getElementById("profile-current").textContent = profile ?
+    "Применён: " + profile.mode + " · dynamic=" + profile.exposure_dynamic_framerate +
+    " · предел: " + (profile.duration_seconds === 0 ? "до остановки" : fmtDuration(profile.duration_seconds)) +
+    (profileDirty ? " · есть неприменённый выбор" : "") : "Профиль не получен";
+  const labels = {unknown: "не проверена", checking: "идёт проверка", ok: "перечисление завершено",
+                  failed: "проверка не удалась", fake: "FAKE — оборудование не проверялось"};
+  document.getElementById("profile-support").textContent =
+    "Поддержка: " + (labels[support.state] || "—") +
+    (support.checked_at ? " · " + support.checked_at : "") +
+    (support.error ? " · " + support.error : "") +
+    (support.fake ? " · фиктивен только просмотр; кнопка записи не является симулятором" : "");
+  document.getElementById("profile-reasons").textContent = options
+    .filter((item) => !item.supported)
+    .map((item) => item.mode + ": " + ((item.reasons || []).join("; ") || "поддержка не подтверждена"))
+    .join("\\n");
+}
+
+for (const id of ["profile-mode", "profile-dynamic", "profile-duration"]) {
+  document.getElementById(id).addEventListener("change", () => {
+    profileDirty = true;
+    profileFeedback("Выбор не применён. Нажмите «Применить профиль».", false);
+    render();
+  });
+}
+document.getElementById("profile-check").addEventListener("click", () => post("profile/check"));
+document.getElementById("profile-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (document.getElementById("profile-apply").disabled || busy) return;
+  const payload = {
+    mode: document.getElementById("profile-mode").value,
+    exposure_dynamic_framerate: Number(document.getElementById("profile-dynamic").value),
+    duration_seconds: Number(document.getElementById("profile-duration").value),
+  };
+  busy = true;
+  render();
+  try {
+    await api("/api/profile/apply", {method: "POST",
+      headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
+    profileDirty = false;
+    profileFeedback("Профиль применён. Камеры не открывались.", false);
+  } catch (error) {
+    profileFeedback(error.message, true);
+  } finally {
+    busy = false;
+    await refresh();
+  }
+});
 
 function setMessage(text, isError) {
   const node = document.getElementById("message");
@@ -282,10 +425,10 @@ document.getElementById("error-ack").addEventListener("click",
 function allowed(command, status) {
   if (!status || busy) return false;
   const state = status.state;
-  if (command === "preview/start") return state === "idle";
+  if (command === "preview/start") return state === "idle" && profileReady(status) && !profileDirty && !status.profile_locked;
   if (command === "preview/stop") return state === "preview";
-  if (command === "record/start") return state === "idle" || state === "preview";
-  if (command === "record/stop") return state === "recording" || state === "starting";
+  if (command === "record/start") return ["idle", "preview"].includes(state) && profileReady(status) && !profileDirty && !(status.state === "idle" && status.profile_locked);
+  if (command === "record/stop") return state === "recording" || (state === "starting" && status.operation === "record");
   if (command === "error/ack") return state === "error";
   return false;
 }
@@ -312,6 +455,11 @@ function renderCamera(cam, status) {
              (status.recording && status.recording.active)) {
     const lines = [];
     lines.push("метаданные: " + (info.status || "—"));
+    const requested = info.requested_mode || {};
+    const negotiated = info.negotiated_mode || {};
+    lines.push("запрошено: " + (requested.width ? requested.width + "x" + requested.height + "@" + requested.fps : "—"));
+    lines.push("открыто: " + (negotiated.width ? negotiated.codec + " " + negotiated.width + "x" + negotiated.height : "—"));
+    lines.push("темп принятых пакетов: " + (info.measured_capture_fps == null ? "—" : info.measured_capture_fps) + " пак/с");
     lines.push("сегментов: " + (info.segments === undefined ? "—" : info.segments) +
                " · " + fmtBytes(info.bytes));
     if (info.last_change_age_s !== null && info.last_change_age_s !== undefined) {
@@ -334,7 +482,10 @@ function renderCamera(cam, status) {
     card.details.textContent =
       "состояние: " + (info.state || info.status || "—") +
       " · кадров: " + (info.published_frames === undefined ? "—" : info.published_frames) +
-      " · клиентов: " + (info.stream_clients === undefined ? "—" : info.stream_clients);
+      " · клиентов: " + (info.stream_clients === undefined ? "—" : info.stream_clients) +
+      " · захват запрошен: " + (info.capture_fps_requested == null ? "—" : info.capture_fps_requested) + " FPS" +
+      " · темп входа: " + (info.capture_fps_measured == null ? "—" : info.capture_fps_measured) + " пак/с" +
+      " · публикация: " + (info.published_fps_measured == null ? "—" : info.published_fps_measured) + " кадр/с";
     if (info.error) {
       card.error.textContent = "Ошибка камеры: " + info.error;
       card.error.hidden = false;
@@ -363,6 +514,11 @@ function renderRecordInfo(status) {
       status.disk.free_mib.toFixed(0) + " МиБ" : "—"],
     ["Порог запуска", status.limits.min_free_mib + " МиБ"],
     ["Критический резерв", status.limits.critical_free_mib + " МиБ"],
+    ["Профиль записи", status.recording.profile ?
+      status.recording.profile.mode + " · dynamic=" + status.recording.profile.exposure_dynamic_framerate : "—"],
+    ["Предел записи", status.recording.profile ?
+      (status.recording.profile.duration_seconds === 0 ? "до остановки" : fmtDuration(status.recording.profile.duration_seconds)) : "—"],
+    ["Публикация просмотра", status.limits.preview_publish_fps + " кадр/с (не FPS захвата)"],
     ["Причина остановки", status.recording.stop_reason || "—"],
     ["Код wrapper", status.recording.exit_code === null ? "—" :
       String(status.recording.exit_code)],
@@ -398,6 +554,12 @@ function renderResult(status) {
     ["Сессия", result.session || "—"],
     ["Ошибка", result.error || "—"],
   ];
+  const cameras = (status.recording && status.recording.cameras) || {};
+  for (const cam of CAMERAS) {
+    const info = cameras[cam.key] || {};
+    rows.push([cam.label + ": темп принятых пакетов",
+      info.measured_capture_fps == null ? "— (ещё не рассчитан)" : info.measured_capture_fps + " пак/с"]);
+  }
   for (const [name, value] of rows) {
     box.append(el("div", "", name), el("div", "", String(value)));
   }
@@ -418,6 +580,7 @@ function render() {
     document.getElementById(command === "error/ack" ? "error-ack" :
       command.replace("/", "-")).disabled = !allowed(command, status);
   }
+  renderProfile(status);
   if (status) {
     renderRecordInfo(status);
     renderResult(status);

@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import record_preflight as preflight
+import record_profiles
 
 DEFAULT_OUTPUT_ROOT = "~/recordings"
 DEFAULT_LOCK_FILE = "~/.cache/usv_record/record_dual.lock"
@@ -99,6 +100,12 @@ def build_recorder_command(python, recorder, spec, device, output_dir, options):
         "--device", device,
         "--output-dir", str(output_dir),
         "--seconds", f"{options.seconds:g}",
+        "--width", str(options.width),
+        "--height", str(options.height),
+        "--fps", f"{options.fps:g}",
+        "--exposure-dynamic-framerate",
+        str(options.exposure_dynamic_framerate),
+        "--v4l2-ctl", str(options.v4l2_ctl),
         "--segment-seconds", f"{options.segment_seconds:g}",
         "--queue-frames", str(options.queue_frames),
         "--queue-mib", str(options.queue_mib),
@@ -346,6 +353,15 @@ def build_parser():
                         help="корень сессий (default: ~/recordings)")
     parser.add_argument("--device-left", default="/dev/video2")
     parser.add_argument("--device-right", default="/dev/video4")
+    parser.add_argument("--width", type=int, default=1280,
+                        help="ширина MJPG-кадра (по умолчанию 1280)")
+    parser.add_argument("--height", type=int, default=720,
+                        help="высота MJPG-кадра (по умолчанию 720)")
+    parser.add_argument("--fps", type=float, default=60,
+                        help="запрашиваемый FPS (по умолчанию 60)")
+    parser.add_argument("--exposure-dynamic-framerate", type=int,
+                        choices=(0, 1), default=0,
+                        help="0 — снижение частоты запрещено, 1 — разрешено")
     parser.add_argument("--seconds", type=float, default=35,
                         help="жёсткий предел, 0 — до остановки оператором")
     parser.add_argument("--segment-seconds", type=float, default=10)
@@ -378,6 +394,13 @@ def main(argv=None):
             or args.critical_free_mib >= args.min_free_mib):
         print("Требуется 0 < --critical-free-mib < --min-free-mib",
               file=sys.stderr)
+        return 1
+    try:
+        mode = record_profiles.resolve_mode(args.width, args.height, args.fps)
+        profile = record_profiles.make_profile(
+            mode["mode"], args.exposure_dynamic_framerate, args.seconds)
+    except record_profiles.ProfileError as exc:
+        print(f"Недопустимый профиль: {exc}", file=sys.stderr)
         return 1
 
     recorder = Path(__file__).resolve().with_name("record_camera_pyav_queue.py")
@@ -420,13 +443,21 @@ def main(argv=None):
                 min_free_mib=args.min_free_mib,
                 critical_free_mib=args.critical_free_mib,
                 v4l2_ctl=args.v4l2_ctl,
+                mode=mode,
+                exposure_dynamic_framerate=(
+                    profile["exposure_dynamic_framerate"]),
             )
         except (preflight.PreflightError, OSError) as exc:
             print(f"Preflight failed: {exc}", file=sys.stderr)
             return 1
 
         space = report["space"]
-        print("Preflight: exposure_dynamic_framerate=0 установлен и "
+        print(f"Profile: {profile['mode']} "
+              f"dynamic={profile['exposure_dynamic_framerate']} "
+              f"duration={profile['duration_seconds']:g}s", flush=True)
+        print("Preflight: режим подтверждён обеими камерами; "
+              f"{preflight.EXPOSURE_CONTROL}="
+              f"{profile['exposure_dynamic_framerate']} установлен и "
               "подтверждён на "
               + ", ".join(item["device"] for item in report["cameras"]),
               flush=True)

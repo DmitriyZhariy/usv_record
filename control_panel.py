@@ -16,6 +16,7 @@ import argparse
 import errno
 import hmac
 import json
+import math
 import os
 import secrets
 import shutil
@@ -33,6 +34,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import preview_dual_mjpeg as preview
+import record_preflight as preflight
+import record_profiles
 from panel_page import PANEL_HTML
 
 DEFAULT_HOST = "0.0.0.0"
@@ -76,6 +79,7 @@ class PanelConfig:
     fake_capture_fps: float = 60.0
     device_left: str = "/dev/video2"
     device_right: str = "/dev/video4"
+    v4l2_ctl: str = preflight.DEFAULT_V4L2_CTL
     output_root: str = DEFAULT_OUTPUT_ROOT
     record_seconds: float = 0.0
     segment_seconds: float = 10.0
@@ -391,7 +395,8 @@ class SubprocessRecordRunner:
 class PanelController:
     def __init__(self, config, token, preview_factory=None,
                  runner_factory=None, probe_lock=None, find_leftovers=None,
-                 disk_usage=None, clock=time.monotonic, sleep=time.sleep):
+                 disk_usage=None, clock=time.monotonic, sleep=time.sleep,
+                 mode_probe=None, prepare_exposure=None):
         self.config = config
         self.token = token
         self.preview_factory = preview_factory or preview.PreviewApp
@@ -401,6 +406,8 @@ class PanelController:
         self.disk_usage = disk_usage or shutil.disk_usage
         self.clock = clock
         self.sleep = sleep
+        self.mode_probe = mode_probe
+        self.prepare_exposure = prepare_exposure or preflight.prepare_exposure
 
         self.preview_facade = PreviewFacade()
 
@@ -442,6 +449,25 @@ class PanelController:
         self._tail = deque(maxlen=80)
         self._snapshot = {}
 
+        self._profile = record_profiles.make_profile(
+            record_profiles.DEFAULT_MODE,
+            record_profiles.DEFAULT_EXPOSURE_DYNAMIC_FRAMERATE,
+            config.record_seconds,
+        )
+        self._mode_support = (
+            self._fake_mode_support() if config.fake_cameras else {
+                "state": "unknown",
+                "checked_at": None,
+                "modes": {},
+                "devices": {},
+                "error": None,
+                "fake": False,
+            })
+        self._mode_probe_thread = None
+        self._launch_profile = dict(self._profile)
+        self._record_profile = None
+        self._preview_profile = None
+
     # ---------- состояние и публикация ----------
 
     def _set_state(self, state, message=None, error=None):
@@ -459,6 +485,143 @@ class PanelController:
         self._set_state(state, message, error=message)
         self._publish()
 
+    # ---------- профиль записи и поддержка режимов ----------
+
+    def _fake_mode_support(self):
+        modes = {
+            item["mode"]: {
+                "supported": True,
+                "reasons": ["тестовый режим панели: аппаратная поддержка "
+                            "не проверялась"],
+            }
+            for item in record_profiles.MODES
+        }
+        return {
+            "state": "fake",
+            "checked_at": _now_iso(),
+            "modes": modes,
+            "devices": {},
+            "error": None,
+            "fake": True,
+        }
+
+    def _request_mode_probe(self):
+        """Проверка в фоне; резервируется под тем же lock, что запуск захвата."""
+        with self._lock:
+            if self._shutdown.is_set():
+                raise CommandError(503, "панель завершает работу")
+            if self._state != "idle":
+                raise CommandError(409, "проверка режимов доступна только в idle")
+            if self._mode_support.get("state") == "checking":
+                return
+            if self.config.fake_cameras:
+                self._mode_support = self._fake_mode_support()
+                return
+            self._mode_support = {
+                "state": "checking", "checked_at": None, "modes": {},
+                "devices": {}, "error": None, "fake": False,
+            }
+            thread = threading.Thread(
+                target=self._run_mode_probe, name="panel-mode-probe",
+                daemon=True)
+            self._mode_probe_thread = thread
+            thread.start()
+
+    def _probe_modes_report(self):
+        devices = [self.config.device_left, self.config.device_right]
+        if self.mode_probe is not None:
+            return self.mode_probe(devices)
+        return preflight.probe_modes(
+            devices, record_profiles.MODES, v4l2_ctl=self.config.v4l2_ctl)
+
+    def _require_profile_support(self, profile):
+        """Вызывать под _lock. Проверка статуса не обращается к устройствам."""
+        support = self._mode_support
+        if support.get("state") not in ("ok", "fake"):
+            raise CommandError(409, "поддержка режимов ещё не подтверждена; "
+                               "дождитесь проверки или повторите её")
+        entry = (support.get("modes") or {}).get(profile["mode"]) or {}
+        if not entry.get("supported"):
+            reason = "; ".join(entry.get("reasons") or [])
+            raise CommandError(409, "режим не подтверждён обеими камерами: "
+                               + (reason or profile["mode"]))
+
+    def apply_profile(self, payload):
+        """Атомарно сохраняет профиль в памяти; настройки камер не меняет."""
+        try:
+            profile = record_profiles.validate_profile(payload)
+        except (record_profiles.ProfileError, TypeError, OverflowError) as exc:
+            raise CommandError(400, str(exc))
+        with self._lock:
+            if self._shutdown.is_set():
+                raise CommandError(503, "панель завершает работу")
+            if self._state != "idle" or self._stuck_preview is not None:
+                raise CommandError(409, "изменение профиля доступно только в idle")
+            self._require_profile_support(profile)
+            self._profile = dict(profile)
+            self._message = "Профиль применён; камеры пока не открыты"
+            self._last_error = None
+        self._publish()
+        return {"ok": True, "profile": dict(profile)}
+
+    def _run_mode_probe(self):
+        try:
+            report = self._probe_modes_report()
+            ok = bool(report.get("ok"))
+            support = {
+                "state": "ok" if ok else "failed",
+                "checked_at": _now_iso(),
+                "modes": report.get("modes") or {},
+                "devices": report.get("devices") or {},
+                "error": None if ok else (
+                    "перечисление режимов не удалось для одной из камер"),
+                "fake": False,
+            }
+        except Exception as exc:
+            support = {
+                "state": "failed",
+                "checked_at": _now_iso(),
+                "modes": {},
+                "devices": {},
+                "error": f"{type(exc).__name__}: {exc}",
+                "fake": False,
+            }
+            print(f"panel: проверка режимов: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+        with self._lock:
+            self._mode_support = support
+        self._publish()
+
+    def _profile_snapshot(self):
+        profile = dict(self._profile)
+        support = self._mode_support
+        modes = support.get("modes") or {}
+        options = []
+        for item in record_profiles.MODES:
+            entry = modes.get(item["mode"]) or {}
+            options.append({
+                "mode": item["mode"],
+                "width": item["width"],
+                "height": item["height"],
+                "fps": item["fps"],
+                "supported": bool(entry.get("supported")),
+                "reasons": list(entry.get("reasons") or []),
+            })
+        return {
+            "profile": profile,
+            "profile_details": record_profiles.profile_details(profile),
+            "profile_options": options,
+            "profile_durations": list(record_profiles.UI_DURATIONS),
+            "profile_locked": self._state != "idle" or self._shutdown.is_set(),
+            "profile_support": {
+                "state": support.get("state"),
+                "checked_at": support.get("checked_at"),
+                "fake": bool(support.get("fake")),
+                "error": support.get("error"),
+                "devices": support.get("devices") or {},
+            },
+        }
+
     def _preview_snapshot(self, now):
         app = self._preview_app
         if app is None:
@@ -467,6 +630,9 @@ class PanelController:
                 "cameras": {},
                 "clients_total": 0,
                 "fake_cameras": self.config.fake_cameras,
+                "capture_mode_requested": None,
+                "capture_fps_requested": None,
+                "profile": None,
             }
         try:
             cameras = {
@@ -476,12 +642,16 @@ class PanelController:
             clients = getattr(app, "clients_total", 0)
         except Exception:
             cameras, clients = {}, 0
+        capture_mode = dict(getattr(app, "capture_mode", {}) or {})
         return {
             "active": self._state in ("preview", "starting", "stopping")
             or self._stuck_preview is not None,
             "cameras": cameras,
             "clients_total": clients,
             "fake_cameras": self.config.fake_cameras,
+            "profile": dict(self._preview_profile) if self._preview_profile else None,
+            "capture_mode_requested": capture_mode or None,
+            "capture_fps_requested": capture_mode.get("fps"),
         }
 
     def _record_cameras_snapshot(self, now):
@@ -516,6 +686,10 @@ class PanelController:
                 "segments": file_info["segments"],
                 "bytes": file_info["bytes"],
                 "last_change_age_s": file_info["last_change_age_s"],
+                "requested_mode": meta.get("requested_mode"),
+                "negotiated_mode": meta.get("negotiated_mode"),
+                "profile": meta.get("profile"),
+                "measured_capture_fps": meta.get("measured_capture_fps"),
             }
         return cameras
 
@@ -539,6 +713,9 @@ class PanelController:
             disk = dict(self._disk)
             tail = list(self._tail)
             stuck = self._stuck_preview is not None
+            profile_info = self._profile_snapshot()
+            record_profile = (dict(self._record_profile)
+                              if self._record_profile else None)
 
         active = runner is not None and exit_code is None
         if active and started is not None:
@@ -549,6 +726,7 @@ class PanelController:
             elapsed = None
 
         return {
+            **profile_info,
             "app": "usv-panel",
             "state": state,
             "operation": operation,
@@ -558,6 +736,7 @@ class PanelController:
             "preview": preview_info,
             "recording": {
                 "active": active,
+                "profile": record_profile,
                 "session": str(session) if session else None,
                 "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
                 "stop_reason": stop_reason,
@@ -567,7 +746,8 @@ class PanelController:
             },
             "disk": disk,
             "limits": {
-                "record_seconds": self.config.record_seconds,
+                "record_seconds": profile_info["profile"]["duration_seconds"],
+                "preview_publish_fps": self.config.fps,
                 "segment_seconds": self.config.segment_seconds,
                 "min_free_mib": self.config.min_free_mib,
                 "critical_free_mib": self.config.critical_free_mib,
@@ -668,6 +848,10 @@ class PanelController:
             self._clear_finished_stuck()
 
     def handle_command(self, command):
+        if command == "profile/check":
+            self._request_mode_probe()
+            self._publish()
+            return {"ok": True, "message": "проверка режимов запрошена"}
         with self._lock:
             if self._shutdown.is_set():
                 raise CommandError(503, "панель завершает работу")
@@ -675,6 +859,9 @@ class PanelController:
             if command == "preview/start":
                 if state != "idle":
                     raise CommandError(409, f"недоступно в состоянии {state}")
+                self._require_profile_support(self._profile)
+                self._launch_profile = dict(self._profile)
+                self._preview_profile = dict(self._profile)
                 self._state = "starting"
                 self._operation = "preview"
                 self._message = "Запуск просмотра обеих камер…"
@@ -690,6 +877,9 @@ class PanelController:
             elif command == "record/start":
                 if state not in ("idle", "preview"):
                     raise CommandError(409, f"недоступно в состоянии {state}")
+                self._require_profile_support(self._profile)
+                self._launch_profile = dict(self._profile)
+                self._record_profile = dict(self._profile)
                 self._state = "starting"
                 self._operation = "record"
                 self._message = "Подготовка записи обеих камер…"
@@ -699,10 +889,13 @@ class PanelController:
                 self._forced = False
                 self._readiness_failed = False
                 self._result = None
-                self._record_exit = None
+                # Код предыдущего wrapper сохраняется до установки нового runner:
+                # иначе _detect_conflicts сочтёт завершённый процесс работающим.
                 self._record_started = None
                 action = self._run_record_start
             elif command == "record/stop":
+                if state == "starting" and self._operation != "record":
+                    raise CommandError(409, "запись не запускается")
                 if state not in ("starting", "recording"):
                     if state == "stopping":
                         return {"ok": True, "message": "остановка уже идёт"}
@@ -782,6 +975,32 @@ class PanelController:
                 raise PanelError("запись ещё работает")
             self._conflicts = []
 
+        with self._lock:
+            profile = dict(self._launch_profile)
+        mode = record_profiles.require_mode(profile["mode"])
+        if not self.config.fake_cameras:
+            try:
+                for device in (self.config.device_left, self.config.device_right):
+                    holders = preflight.find_device_holders(device)
+                    if holders:
+                        raise preflight.PreflightError(
+                            f"{device}: устройство занято процессами {holders}")
+                report = self._probe_modes_report()
+                entry = (report.get("modes") or {}).get(profile["mode"]) or {}
+                if not report.get("ok") or not entry.get("supported"):
+                    raise preflight.PreflightError(
+                        "режим просмотра не подтверждён: "
+                        + "; ".join(entry.get("reasons") or [profile["mode"]]))
+                if self._shutdown.is_set():
+                    raise PanelError("панель завершает работу")
+                self.prepare_exposure(
+                    [self.config.device_left, self.config.device_right],
+                    profile["exposure_dynamic_framerate"],
+                    v4l2_ctl=self.config.v4l2_ctl)
+            except preflight.PreflightError as exc:
+                raise PanelError(f"Preflight просмотра: {exc}")
+        if self._shutdown.is_set():
+            raise PanelError("панель завершает работу")
         app = self.preview_factory(
             devices={"left": self.config.device_left,
                      "right": self.config.device_right},
@@ -789,6 +1008,7 @@ class PanelController:
             max_clients=self.config.max_clients,
             fake_cameras=self.config.fake_cameras,
             fake_capture_fps=self.config.fake_capture_fps,
+            capture_mode=mode,
         )
         with self._lock:
             if self._shutdown.is_set():
@@ -851,6 +1071,9 @@ class PanelController:
     # ---------- запись ----------
 
     def _build_record_argv(self):
+        with self._lock:
+            profile = dict(self._launch_profile)
+        mode = record_profiles.require_mode(profile["mode"])
         script = self.config.dual_script
         if not script:
             script = str(Path(__file__).resolve().with_name(
@@ -860,7 +1083,13 @@ class PanelController:
             "--output-root", str(Path(self.config.output_root).expanduser()),
             "--device-left", self.config.device_left,
             "--device-right", self.config.device_right,
-            "--seconds", f"{self.config.record_seconds:g}",
+            "--seconds", f"{profile['duration_seconds']:g}",
+            "--width", str(mode["width"]),
+            "--height", str(mode["height"]),
+            "--fps", f"{mode['fps']:g}",
+            "--exposure-dynamic-framerate",
+            str(profile["exposure_dynamic_framerate"]),
+            "--v4l2-ctl", self.config.v4l2_ctl,
             "--segment-seconds", f"{self.config.segment_seconds:g}",
             "--queue-frames", str(self.config.queue_frames),
             "--queue-mib", str(self.config.queue_mib),
@@ -1200,6 +1429,7 @@ class PanelController:
             self._operation = None
             self._message = "Ошибка сброшена; панель ожидает команды"
             self._last_error = None
+            self._request_mode_probe()
 
     # ---------- монитор и завершение ----------
 
@@ -1258,6 +1488,8 @@ class PanelController:
         self._monitor = threading.Thread(
             target=self._monitor_loop, name="panel-monitor", daemon=True)
         self._monitor.start()
+        if not conflicts:
+            self._request_mode_probe()
         self._publish()
 
     def shutdown(self, reason="остановка панели"):
@@ -1457,6 +1689,7 @@ class PanelHandler(preview.PreviewHandler):
         if length < 0 or length > MAX_REQUEST_BODY:
             return self._send_json(
                 413, {"ok": False, "message": "слишком большое тело запроса"})
+        body = {}
         raw = self.rfile.read(length) if length else b""
         if raw.strip():
             try:
@@ -1470,7 +1703,10 @@ class PanelHandler(preview.PreviewHandler):
 
         command = path[len("/api/"):]
         try:
-            result = self.server.panel.handle_command(command)
+            if command == "profile/apply":
+                result = self.server.panel.apply_profile(body)
+            else:
+                result = self.server.panel.handle_command(command)
         except CommandError as exc:
             return self._send_json(
                 exc.status, {"ok": False, "message": str(exc)})
@@ -1480,7 +1716,7 @@ class PanelHandler(preview.PreviewHandler):
                       "message": f"{type(exc).__name__}: {exc}"})
         payload = {"ok": True, "state": self.server.panel.status().get("state")}
         payload.update(result)
-        return self._send_json(202, payload)
+        return self._send_json(200 if command == "profile/apply" else 202, payload)
 
 
 def build_parser():
@@ -1493,6 +1729,7 @@ def build_parser():
                         default=preview.DEFAULT_MAX_CLIENTS)
     parser.add_argument("--device-left", default="/dev/video2")
     parser.add_argument("--device-right", default="/dev/video4")
+    parser.add_argument("--v4l2-ctl", default=preflight.DEFAULT_V4L2_CTL)
     parser.add_argument("--fake-cameras", action="store_true",
                         help="тестовые JPEG без обращения к устройствам")
     parser.add_argument("--fake-capture-fps", type=float, default=60.0)
@@ -1534,6 +1771,7 @@ def config_from_args(args):
         fake_capture_fps=args.fake_capture_fps,
         device_left=args.device_left,
         device_right=args.device_right,
+        v4l2_ctl=args.v4l2_ctl,
         output_root=args.output_root,
         record_seconds=args.record_seconds,
         segment_seconds=args.segment_seconds,
@@ -1561,7 +1799,7 @@ def validate_config(config):
         raise PanelError("частоты должны быть > 0")
     if config.max_clients <= 0:
         raise PanelError("--max-clients должен быть > 0")
-    if config.record_seconds < 0:
+    if not math.isfinite(config.record_seconds) or config.record_seconds < 0:
         raise PanelError("--record-seconds должен быть >= 0")
     if min(config.segment_seconds, config.queue_frames, config.queue_mib) <= 0:
         raise PanelError("segment-seconds, queue-frames и queue-mib должны быть > 0")
