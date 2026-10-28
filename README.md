@@ -7,13 +7,15 @@
 
 Актуальное руководство: [docs/HANDOVER_RU.md](docs/HANDOVER_RU.md).
 Оно описывает просмотр при записи, текущие пути и увеличенные таймауты.
+Порядок безопасной очистки: [docs/CLEANUP_RU.md](docs/CLEANUP_RU.md).
 Старые PANEL.md/RECORDING.md/PREVIEW.md сохранены как история и могут содержать устаревшие инструкции.
 
 ## Развёртывание
 
-Код установки: `/root/recorder-profile-test-20261025-080008`.
+Код установки: `/root/usv-release-e8d15fb`.
 Python: `/root/recorder/venv-pyav14/bin/python`, Python 3.10.12, PyAV 14.0.0.
 Служба: `deploy/usv-panel.service`; обязательно также `deploy/usv-panel.service.d/20-verification-timeout.conf`.
+На 28.10.2026 служба уже была переключена на `/root/usv-release-e8d15fb` и работала; drop-in с `TimeoutStopSec=3720s` применён.
 Не устанавливайте unit автоматически на другую машину: абсолютные пути требуется сверить.
 Запись по кнопке, не при загрузке. Перед захватом вручную выбрать проверенный профиль.
 
@@ -21,4 +23,6 @@ Python: `/root/recorder/venv-pyav14/bin/python`, Python 3.10.12, PyAV 14.0.0.
 
 `docs/installed-source-manifest.json` содержит SHA-256 исходных файлов, включая их окончания строк.
 Git может нормализовать CRLF в LF. Файл манифеста содержит обе формы хешей.
+Манифест описывает исходный снимок до переключения службы на `/root/usv-release-e8d15fb`.
+Хеш systemd-unit в нём относится к прежнему варианту с путём `/root/recorder-profile-test-20261025-080008`; текущий unit после переключения имеет другой хеш.
 Токены, пароли, ключи SSH, OpenCode-конфигурация, venv и видеоданные не входят в этот снимок.

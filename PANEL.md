@@ -1,5 +1,9 @@
 # Веб-панель просмотра и записи двух камер
 
+> Исторический документ. Актуальное руководство по установке:
+> [docs/HANDOVER_RU.md](docs/HANDOVER_RU.md). Отдельные разделы могут
+> описывать прежние порт и пути.
+
 `control_panel.py` — одна страница на порту 8088 для ноутбука или
 телефона. Панель не захватывает видео и не пишет файлы сама:
 
@@ -222,7 +226,7 @@ MJPEG-потоки и диагностический JPEG (они загружа
 не удаляются.
 
 `--seconds 0` означает «до остановки оператором». Значение по
-умолчанию у CLI остаётся 35; панель явно передаёт `0`.
+умолчанию у CLI wrapper остаётся 35; панель явно передаёт `0`.
 
 ## Ручной запуск
 
@@ -254,7 +258,7 @@ MJPEG-потоки и диагностический JPEG (они загружа
 | `--critical-free-mib` | `1024` | порог штатной остановки |
 | `--device-left`, `--device-right` | `/dev/video2`, `/dev/video4` | устройства |
 | `--token-file` | `~/.config/usv-panel/token` | файл токена |
-| `--stop-wait-seconds` | `110` | ожидание wrapper при остановке панели |
+| `--stop-wait-seconds` | `3660` | ожидание wrapper при остановке панели |
 
 `--fake-cameras` подставляет тестовые JPEG и не открывает устройства.
 Это проверка страницы и HTTP, а не V4L2/PyAV.
@@ -270,6 +274,8 @@ MJPEG-потоки и диагностический JPEG (они загружа
 Установка (выполняет пользователь, не агент):
 
     sudo install -m 644 deploy/usv-panel.service /etc/systemd/system/usv-panel.service
+    sudo install -D -m 644 deploy/usv-panel.service.d/20-verification-timeout.conf \
+      /etc/systemd/system/usv-panel.service.d/20-verification-timeout.conf
     sudo systemctl daemon-reload
     sudo systemctl enable --now usv-panel.service
     systemctl status usv-panel.service
@@ -284,11 +290,13 @@ MJPEG-потоки и диагностический JPEG (они загружа
     sudo rm /etc/systemd/system/usv-panel.service
     sudo systemctl daemon-reload
 
-`KillMode=mixed` и `TimeoutStopSec=120` согласованы с бюджетом панели
-110 с: сначала SIGTERM получает панель, и она сама останавливает
-wrapper. SIGKILL всему cgroup применяется только по истечении
-таймаута. `start_new_session` у wrapper не выводит его из cgroup
-службы; это не способ пережить остановку службы.
+`KillMode=mixed` и `TimeoutStopSec=150` в unit согласованы с базовым
+бюджетом панели; для длинной проверки используется drop-in
+`TimeoutStopSec=3720s`. Панель ждёт wrapper до 3660 секунд: сначала
+SIGTERM получает панель, и она сама останавливает wrapper. SIGKILL
+всему cgroup применяется только по истечении таймаута.
+`start_new_session` у wrapper не выводит его из cgroup службы; это не
+способ пережить остановку службы.
 
 `Restart=no` выбран намеренно: после аварийного завершения панели
 запись не перезапускается автоматически. При следующем ручном
