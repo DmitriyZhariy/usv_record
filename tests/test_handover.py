@@ -37,10 +37,10 @@ class TimeoutPreservationTests(unittest.TestCase):
 class DeploymentFilesTests(unittest.TestCase):
     def test_unit_and_dropin_use_verified_release_path(self):
         unit = (ROOT / "deploy" / "usv-panel.service").read_text(encoding="utf-8")
-        self.assertIn("WorkingDirectory=/root/usv-release-e8d15fb", unit)
+        self.assertIn("WorkingDirectory=/root/usv_record", unit)
         self.assertIn(
             "ExecStart=/root/recorder/venv-pyav14/bin/python "
-            "/root/usv-release-e8d15fb/control_panel.py",
+            "/root/usv_record/control_panel.py",
             unit,
         )
         self.assertNotIn("/root/recorder-profile-test-20261025-080008", unit)

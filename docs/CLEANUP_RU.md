@@ -8,7 +8,7 @@
 
 ## 1. Текущее состояние на 28.10.2026
 
-- Служба `usv-panel.service` активна, `WorkingDirectory=/root/usv-release-e8d15fb`.
+- Служба `usv-panel.service` активна, `WorkingDirectory=/root/usv_record`.
 - Drop-in `TimeoutStopSec=3720s` применён.
 - `/dev/root`: 58G, занято 51G, свободно 4,3G (93%).
 - Порог запуска записи: 4096 MiB свободно; критический резерв: 1024 MiB.
@@ -19,7 +19,7 @@
 
 ## 2. Что нельзя удалять
 
-- `/root/usv-release-e8d15fb` — действующий код службы.
+- `/root/usv_record` — действующий код службы.
 - `/root/recorder/venv-pyav14` — интерпретатор из `ExecStart`.
 - `/etc/systemd/system/usv-panel.service` и каталог `.d`.
 - Настройки сети, токен панели, SSH-ключи, `.env` и другие секреты.
