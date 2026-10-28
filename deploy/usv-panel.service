@@ -7,9 +7,9 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/root/recorder-profile-test-20261025-080008
+WorkingDirectory=/root/usv-release-e8d15fb
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/root/recorder/venv-pyav14/bin/python /root/recorder-profile-test-20261025-080008/control_panel.py --host 0.0.0.0 --port 8099 --device-left /dev/video2 --device-right /dev/video4 --output-root /root/recordings --record-seconds 0
+ExecStart=/root/recorder/venv-pyav14/bin/python /root/usv-release-e8d15fb/control_panel.py --host 0.0.0.0 --port 8099 --device-left /dev/video2 --device-right /dev/video4 --output-root /root/recordings --record-seconds 0
 Restart=no
 KillMode=mixed
 KillSignal=SIGTERM
