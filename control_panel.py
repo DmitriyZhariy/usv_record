@@ -31,11 +31,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import preview_dual_mjpeg as preview
 import record_preflight as preflight
 import record_profiles
+import recording_preview
 from panel_page import PANEL_HTML
 
 DEFAULT_HOST = "0.0.0.0"
@@ -51,7 +52,7 @@ READY_TIMEOUT = 30.0
 PREVIEW_READY_TIMEOUT = 15.0
 STATUS_INTERVAL = 1.0
 DISK_INTERVAL = 5.0
-STOP_WAIT_SECONDS = 110.0
+STOP_WAIT_SECONDS = 3660.0
 MAX_REQUEST_BODY = 4096
 MIB = 1024 * 1024
 
@@ -467,6 +468,8 @@ class PanelController:
         self._launch_profile = dict(self._profile)
         self._record_profile = None
         self._preview_profile = None
+        self._record_preview = None
+        self._record_preview_error = None
 
     # ---------- состояние и публикация ----------
 
@@ -713,6 +716,7 @@ class PanelController:
             disk = dict(self._disk)
             tail = list(self._tail)
             stuck = self._stuck_preview is not None
+            record_preview_info = self._record_preview_snapshot()
             profile_info = self._profile_snapshot()
             record_profile = (dict(self._record_profile)
                               if self._record_profile else None)
@@ -727,6 +731,7 @@ class PanelController:
 
         return {
             **profile_info,
+            "recording_preview": record_preview_info,
             "app": "usv-panel",
             "state": state,
             "operation": operation,
@@ -958,6 +963,8 @@ class PanelController:
                 self._message = "Ошибка запуска; остановка wrapper…"
         if active:
             runner.terminate()
+        else:
+            self._stop_record_preview()
 
     # ---------- просмотр ----------
 
@@ -1070,6 +1077,37 @@ class PanelController:
 
     # ---------- запись ----------
 
+    def _prepare_record_preview(self):
+        self._stop_record_preview()
+        try:
+            app = recording_preview.RecordPreview(self.config.max_clients)
+            error = None
+        except Exception as exc:
+            app = None
+            error = f"{type(exc).__name__}: {exc}"
+        with self._lock:
+            self._record_preview = app
+            self._record_preview_error = error
+
+    def _stop_record_preview(self):
+        with self._lock:
+            app, self._record_preview = self._record_preview, None
+        if app is not None:
+            app.close()
+
+    def _record_preview_snapshot(self):
+        app = self._record_preview
+        if app is None:
+            return {"active": False, "source": "recorder", "cameras": {},
+                    "error": self._record_preview_error}
+        try:
+            data = app.snapshot()
+            data["error"] = self._record_preview_error
+            return data
+        except Exception as exc:
+            return {"active": False, "source": "recorder", "cameras": {},
+                    "error": f"{type(exc).__name__}: {exc}"}
+
     def _build_record_argv(self):
         with self._lock:
             profile = dict(self._launch_profile)
@@ -1078,7 +1116,7 @@ class PanelController:
         if not script:
             script = str(Path(__file__).resolve().with_name(
                 "record_dual_session.py"))
-        return [
+        command = [
             sys.executable, str(Path(script).resolve()),
             "--output-root", str(Path(self.config.output_root).expanduser()),
             "--device-left", self.config.device_left,
@@ -1097,6 +1135,12 @@ class PanelController:
             "--critical-free-mib", str(self.config.critical_free_mib),
             "--lock-file", str(Path(self.config.record_lock_file).expanduser()),
         ]
+        with self._lock:
+            app = self._record_preview
+        if app is not None:
+            command.extend(["--preview-root", str(app.directory)])
+        return command
+
 
     def _on_record_line(self, line):
         with self._lock:
@@ -1199,6 +1243,7 @@ class PanelController:
                 self._stop_requested = False
                 return
 
+        self._prepare_record_preview()
         argv = self._build_record_argv()
         runner = self.runner_factory(argv, self._on_record_line)
         with self._lock:
@@ -1210,6 +1255,7 @@ class PanelController:
                                  if self._shutdown.is_set()
                                  else "Запуск отменён")
                 self._stop_requested = False
+                self._stop_record_preview()
                 return
             self._record_runner = runner
             self._record_exit = None
@@ -1380,6 +1426,7 @@ class PanelController:
                          + ", ".join(f"{key}={value}"
                                      for key, value in verification.items()))
 
+            self._stop_record_preview()
             finished = self.clock()
             duration = None
             if started is not None:
@@ -1574,6 +1621,7 @@ class PanelController:
             self._monitor.join(timeout=2.0)
         if runner is not None:
             runner.close()
+        self._stop_record_preview()
         self._publish()
         return success
 
@@ -1661,12 +1709,60 @@ class PanelHandler(preview.PreviewHandler):
             with self.server.panel._lock:
                 state = self.server.panel._state
                 app = self.server.panel._preview_app
+                record_app = self.server.panel._record_preview
+                record_active = self.server.panel._record_exit is None
+            if (record_app is not None and record_active
+                    and state in ("starting", "recording", "stopping")):
+                return self._send_record_preview(record_app, path, parsed.query)
             if state != "preview" or app is None:
                 return self._send_body(
                     503, "text/plain; charset=utf-8",
                     b"preview is not running")
             return super().do_GET()
         self._send_body(404, "text/plain; charset=utf-8", b"not found")
+
+    def _send_record_preview(self, app, path, query):
+        diagnostic = path == "/diagnostics/frame.jpg"
+        key = (parse_qs(query).get("camera", ["left"])[0] if diagnostic
+               else path[len("/stream/"):-len(".mjpg")])
+        if key not in recording_preview.CAMERAS:
+            return self._send_body(404, "text/plain", b"unknown camera")
+        if diagnostic:
+            frame = app.read_frame(key)
+            if frame is None:
+                return self._send_body(503, "text/plain", b"no recording preview frame yet")
+            age = max(0.0, (time.monotonic_ns() - frame.mono_ns) / 1e9)
+            if age > recording_preview.STALE_SECONDS:
+                return self._send_body(503, "text/plain", b"recording preview frame is stale")
+            return self._send_body(200, "image/jpeg", frame.payload,
+                {"X-Frame-Age-Ms": f"{age * 1000:.1f}",
+                 "Content-Disposition": f'attachment; filename="{key}-recording-preview.jpg"'})
+        if not app.acquire_client(key):
+            return self._send_body(503, "text/plain", b"preview client limit or stopped")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=usvframe")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            self.connection.settimeout(preview.STREAM_WRITE_TIMEOUT_S)
+            last_seq = None
+            while not app.stop_event.is_set():
+                frame = app.read_frame(key)
+                if frame is not None and frame.seq != last_seq:
+                    age = (time.monotonic_ns() - frame.mono_ns) / 1e9
+                    if age <= recording_preview.STALE_SECONDS:
+                        header = ("--usvframe\r\nContent-Type: image/jpeg\r\n"
+                                  f"Content-Length: {len(frame.payload)}\r\n\r\n").encode("ascii")
+                        self.wfile.write(header + frame.payload + b"\r\n")
+                        self.wfile.flush()
+                        last_seq = frame.seq
+                app.stop_event.wait(0.2)
+        except (OSError, TimeoutError):
+            pass
+        finally:
+            app.release_client(key)
 
     def do_POST(self):
         path = urlparse(self.path).path

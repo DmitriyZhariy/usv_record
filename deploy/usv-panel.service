@@ -1,6 +1,5 @@
 [Unit]
-Description=USV: веб-панель просмотра и записи двух камер
-Documentation=file:/root/recorder/PANEL.md
+Description=USV camera control panel
 After=network-online.target
 Wants=network-online.target
 
@@ -8,17 +7,14 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/root/recorder
+WorkingDirectory=/root/recorder-profile-test-20261025-080008
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/root/recorder/venv-pyav14/bin/python /root/recorder/control_panel.py --host 0.0.0.0 --port 8088
-# Панель не начинает запись сама: после загрузки состояние idle.
+ExecStart=/root/recorder/venv-pyav14/bin/python /root/recorder-profile-test-20261025-080008/control_panel.py --host 0.0.0.0 --port 8099 --device-left /dev/video2 --device-right /dev/video4 --output-root /root/recordings --record-seconds 0
 Restart=no
-# SIGTERM получает панель; она штатно останавливает wrapper и ждёт его
-# до 110 с. SIGKILL всему cgroup — только после TimeoutStopSec.
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStartSec=30
-TimeoutStopSec=120
+TimeoutStopSec=150
 
 [Install]
 WantedBy=multi-user.target

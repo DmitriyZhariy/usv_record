@@ -1,0 +1,79 @@
+{
+  "snapshot_sha256": "f2ec2d7b4a91a0c86e415dae571b4b44b9f5065025e6b1312da1570fd34c8003",
+  "base_commit": "1089ec45d28345f2f723339954c13c42afefa90a",
+  "files": [
+    {
+      "source_path": "runtime/control_panel.py",
+      "sha256_original": "7c9f65e26091f4f7082c6e7309d4daefc90d642704158f5ebaa3b49d70f4e710",
+      "sha256_LF": "7c9f65e26091f4f7082c6e7309d4daefc90d642704158f5ebaa3b49d70f4e710",
+      "bytes": 82527
+    },
+    {
+      "source_path": "runtime/panel_page.py",
+      "sha256_original": "a9ceeb3f6487d9b26e9478ce2f2cef69a8356fa2e87a418f209ac18cbc1e1d4c",
+      "sha256_LF": "bc6ab9a78749fffbc5857acd1fa55409c532c0e53cd0b08b44fbb1f59035bb3c",
+      "bytes": 32846
+    },
+    {
+      "source_path": "runtime/preview_dual_mjpeg.py",
+      "sha256_original": "33bb586f149f153396db3df24c99d3ccab65f7179e1d3b091417236388886aa8",
+      "sha256_LF": "33bb586f149f153396db3df24c99d3ccab65f7179e1d3b091417236388886aa8",
+      "bytes": 59868
+    },
+    {
+      "source_path": "runtime/record_profiles.py",
+      "sha256_original": "95d028e1fc5fe555d946d64fed2670bba3fe8b8a2580ade861399e6a717f69bb",
+      "sha256_LF": "0b726612c7db5ac18bf8f748b7215a5b0dca409da2a32c3ccae3207878d0cd05",
+      "bytes": 8050
+    },
+    {
+      "source_path": "runtime/record_preflight.py",
+      "sha256_original": "2a25165aadba2c56c32a6e7a53c4bc52bf2152177038a650b7cae22cc9219714",
+      "sha256_LF": "f5cb5de88c804b56750a59b769048d8e83e28195457c3034826feeb2c1a54ff6",
+      "bytes": 17935
+    },
+    {
+      "source_path": "runtime/record_dual_session.py",
+      "sha256_original": "2cbce45cb657ec5e64ea7c656e4bc4bbc00cb2bca1723d5aa8af577e833401f5",
+      "sha256_LF": "2cbce45cb657ec5e64ea7c656e4bc4bbc00cb2bca1723d5aa8af577e833401f5",
+      "bytes": 21152
+    },
+    {
+      "source_path": "runtime/record_camera_pyav_queue.py",
+      "sha256_original": "d950452deab4ce527e99cadf0c283bfecf80fe08cc2fe426bcf92c3c14b2572c",
+      "sha256_LF": "df871278454d287da582641141a38843ae0b8701363a412b8d36b664f2e6b75a",
+      "bytes": 22339
+    },
+    {
+      "source_path": "runtime/recording_preview.py",
+      "sha256_original": "619c2a66431230de035870a6e1453dc03f1edf06a9332a3d6efb57fec181a44b",
+      "sha256_LF": "9d625a0223c29bbb7fc54dd22f9d772112b4c340d3e90d917ca78c5913e5879b",
+      "bytes": 8296
+    },
+    {
+      "source_path": "runtime/PANEL.md",
+      "sha256_original": "ee73110e1e4803e5cd8960b81ca0c4b0485b52bbe46f5a29f8e54092891018c5",
+      "sha256_LF": "6640fe618d5645c3a843133f5e33c8e8a4d8c86e4a625b7ae785e047e8565fb6",
+      "bytes": 26134
+    },
+    {
+      "source_path": "runtime/RECORDING.md",
+      "sha256_original": "92f3f5543477880a21fc5169ef417809ccb2f1e84c4f933fa2bc4cb35a8d5cad",
+      "sha256_LF": "431ab565929036099f1280941af52542b45aaf30678ee989f297c0592589e8c6",
+      "bytes": 18825
+    },
+    {
+      "source_path": "/etc/systemd/system/usv-panel.service",
+      "sha256_original": "06079cfc6191873cffa046ec4cf96cbbce40f81b9a53cf6c95da2294579bb6df",
+      "sha256_LF": "06079cfc6191873cffa046ec4cf96cbbce40f81b9a53cf6c95da2294579bb6df",
+      "bytes": 596
+    },
+    {
+      "source_path": "/etc/systemd/system/usv-panel.service.d/20-verification-timeout.conf",
+      "sha256_original": "41f3fdb4f6288897bbb1b6c19e727aa9e161e6f641a2903ef99c70aa984b82ea",
+      "sha256_LF": "41f3fdb4f6288897bbb1b6c19e727aa9e161e6f641a2903ef99c70aa984b82ea",
+      "bytes": 31
+    }
+  ],
+  "note": "Source-byte hashes refer to installed snapshot; Git may normalize CRLF to LF."
+}

@@ -102,6 +102,9 @@ PANEL_HTML = """<!doctype html>
       <button id="error-ack" type="button">Сбросить ошибку</button>
     </div>
     <p id="message"></p>
+    <p class="muted">Во время записи изображение идёт из рекордеров, до 2 кадр/с.
+      Пропускаются только кадры просмотра, не пакеты записи.
+      Если изображение устарело, проверьте возраст кадра в карточке.</p>
     <p id="conflicts" class="warning"></p>
   </section>
 
@@ -164,6 +167,7 @@ const TOKEN_KEY = "usvPanelToken";
 let token = localStorage.getItem(TOKEN_KEY) || "";
 let lastStatus = null;
 let busy = false;
+let streamSource = "";
 let profileDirty = false;
 let profileServerKey = "";
 let profileOptionsKey = "";
@@ -455,6 +459,12 @@ function renderCamera(cam, status) {
              (status.recording && status.recording.active)) {
     const lines = [];
     lines.push("метаданные: " + (info.status || "—"));
+    const live = status.recording_preview || {};
+    const liveCam = (live.cameras || {})[cam.key] || {};
+    const previewWarning = live.error || liveCam.warning;
+    lines.push("просмотр из рекордера: " +
+      (previewWarning ? previewWarning : (liveCam.has_frame ?
+       "кадр " + liveCam.last_frame_age_s + " с назад · до 2 кадр/с" : "ожидание кадра")));
     const requested = info.requested_mode || {};
     const negotiated = info.negotiated_mode || {};
     lines.push("запрошено: " + (requested.width ? requested.width + "x" + requested.height + "@" + requested.fps : "—"));
@@ -587,7 +597,14 @@ function render() {
     for (const cam of CAMERAS) renderCamera(cam, status);
   }
 
-  if (status && status.state === "preview") {
+  const wantedSource = status && status.state === "preview" ? "preview" :
+    (status && status.recording && status.recording.active &&
+     status.recording_preview && status.recording_preview.active ? "recorder" : "");
+  if (wantedSource !== streamSource) {
+    for (const cam of CAMERAS) stopStream(cam.key);
+    streamSource = wantedSource;
+  }
+  if (wantedSource) {
     for (const cam of CAMERAS) startStream(cam.key);
   } else {
     for (const cam of CAMERAS) stopStream(cam.key);

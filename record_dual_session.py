@@ -24,8 +24,8 @@ import record_profiles
 
 DEFAULT_OUTPUT_ROOT = "~/recordings"
 DEFAULT_LOCK_FILE = "~/.cache/usv_record/record_dual.lock"
-STOP_GRACE_SECONDS = 35.0
-EXIT_GRACE_SECONDS = 60.0
+STOP_GRACE_SECONDS = 3600.0
+EXIT_GRACE_SECONDS = 3600.0
 POLL_INTERVAL = 0.05
 DEFAULT_MIN_FREE_MIB = 4096
 DEFAULT_CRITICAL_FREE_MIB = 1024
@@ -93,7 +93,7 @@ def create_session(root, now=None):
 
 
 def build_recorder_command(python, recorder, spec, device, output_dir, options):
-    return [
+    command = [
         str(python),
         str(recorder),
         "--camera-id", spec["id"],
@@ -110,6 +110,10 @@ def build_recorder_command(python, recorder, spec, device, output_dir, options):
         "--queue-frames", str(options.queue_frames),
         "--queue-mib", str(options.queue_mib),
     ]
+
+    if getattr(options, "preview_root", None):
+        command.extend(["--preview-root", str(options.preview_root)])
+    return command
 
 
 def _alive(children):
@@ -362,6 +366,7 @@ def build_parser():
     parser.add_argument("--exposure-dynamic-framerate", type=int,
                         choices=(0, 1), default=0,
                         help="0 — снижение частоты запрещено, 1 — разрешено")
+    parser.add_argument("--preview-root", default=None)
     parser.add_argument("--seconds", type=float, default=35,
                         help="жёсткий предел, 0 — до остановки оператором")
     parser.add_argument("--segment-seconds", type=float, default=10)

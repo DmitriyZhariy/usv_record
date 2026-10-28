@@ -16,6 +16,7 @@ from pathlib import Path
 import av
 
 import record_profiles
+import recording_preview
 import record_preflight as preflight
 
 stop_requested = False
@@ -226,6 +227,8 @@ def main():
                         help="0 — снижение частоты запрещено, 1 — разрешено")
     parser.add_argument("--v4l2-ctl", default=preflight.DEFAULT_V4L2_CTL,
                         help="путь к v4l2-ctl для проверки dynamic")
+    parser.add_argument("--preview-root", default=None,
+                        help="приватный каталог последнего JPEG (задаёт панель)")
     parser.add_argument("--segment-seconds", type=float, default=10)
     parser.add_argument("--queue-frames", type=int, default=120)
     parser.add_argument("--queue-mib", type=int, default=32)
@@ -310,6 +313,16 @@ def main():
     capture_error = None
     first_packet_ns = None
     last_packet_ns = None
+    preview_publisher = None
+    if args.preview_root:
+        try:
+            preview_publisher = recording_preview.SnapshotPublisher(
+                args.preview_root, args.camera_id)
+            preview_publisher.start()
+        except Exception as exc:
+            preview_publisher = None
+            report["recording_preview"] = {
+                "enabled": False, "error": f"{type(exc).__name__}: {exc}"}
 
     try:
         options = record_profiles.capture_options(mode)
@@ -379,6 +392,13 @@ def main():
                     if first_packet_ns is None:
                         first_packet_ns = mono_ns
                     last_packet_ns = mono_ns
+                    if preview_publisher is not None:
+                        try:
+                            preview_publisher.offer(
+                                item["payload"], mono_ns, item["frame_id"])
+                        except Exception as exc:
+                            # Preview не участвует в критериях verified.
+                            preview_publisher.error = f"{type(exc).__name__}: {exc}"
                     item = None
                 else:
                     raise RuntimeError("Camera stream ended unexpectedly")
@@ -407,6 +427,13 @@ def main():
             report["writer"] = result
         else:
             report["writer_result_unavailable"] = True
+        if preview_publisher is not None:
+            try:
+                preview_publisher.close()
+                report["recording_preview"] = preview_publisher.snapshot()
+            except Exception as exc:
+                report["recording_preview"] = {
+                    "enabled": False, "error": f"{type(exc).__name__}: {exc}"}
         report["measured_capture_fps"] = record_profiles.measured_rate(
             first_packet_ns, last_packet_ns, report["accepted_packets"])
         report["status"] = "failed"
